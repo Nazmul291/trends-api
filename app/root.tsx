@@ -1,4 +1,5 @@
 import { Links, Meta, Outlet, Scripts, ScrollRestoration } from "react-router";
+import { GlobalNavigationSpinner } from "./components/atoms/GlobalNavigationSpinner";
 
 export default function App() {
   return (
@@ -15,6 +16,7 @@ export default function App() {
         <Links />
       </head>
       <body>
+        <GlobalNavigationSpinner />
         <Outlet />
         <ScrollRestoration />
         <Scripts />

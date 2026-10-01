@@ -35,6 +35,11 @@ interface CatalogState {
   productsStatus: StoreStatus;
   productsError: string | null;
 
+  // Sync state
+  syncingProductId: string | null;
+  deletingProductId: string | null;
+  syncedProductMap: Record<string, { shopifyProductId: string; shopifyNumericId?: string; isSynced: boolean }>;
+
   // Actions
   fetchCategories: (options?: { incDiscontinued?: boolean; bypassCache?: boolean }) => Promise<void>;
   fetchProducts: (options?: {
@@ -43,6 +48,9 @@ interface CatalogState {
     search?: string;
     bypassCache?: boolean;
   }) => Promise<void>;
+  fetchSyncStatuses: (codes?: string[]) => Promise<void>;
+  syncProductToShopify: (product: ProductData) => Promise<{ success: boolean; data?: any; error?: string }>;
+  deleteProductFromShopify: (product: ProductData) => Promise<{ success: boolean; error?: string }>;
   setSelectedCategory: (categoryId: number | string | null) => void;
   setSearchQuery: (query: string) => void;
   setPage: (pageNo: number) => void;
@@ -76,6 +84,9 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
   filters: DEFAULT_FILTERS,
   productsStatus: "idle",
   productsError: null,
+  syncingProductId: null,
+  deletingProductId: null,
+  syncedProductMap: {},
 
   fetchCategories: async (options = {}) => {
     if (activeCategoriesAbortController) {
@@ -194,6 +205,11 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
         productsStatus: "success",
         productsError: null,
       });
+
+      // Automatically fetch sync status for returned products
+      if (items.length > 0) {
+        get().fetchSyncStatuses(items.map((p) => p.code));
+      }
     } catch (err: unknown) {
       if ((err as Error)?.name === "AbortError") return;
       set({
@@ -202,6 +218,28 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
       });
     } finally {
       activeProductsAbortController = null;
+    }
+  },
+
+  fetchSyncStatuses: async (codes = []) => {
+    const region = useRegionStore.getState().currentRegion;
+    try {
+      const url = codes.length > 0
+        ? `/api/proxy/${region}/sync-status?codes=${codes.join(",")}`
+        : `/api/proxy/${region}/sync-status`;
+      const res = await fetch(url);
+      if (!res.ok) return;
+      const json = await res.json();
+      if (json.success && json.data) {
+        set((state) => ({
+          syncedProductMap: {
+            ...state.syncedProductMap,
+            ...json.data,
+          },
+        }));
+      }
+    } catch {
+      // Non-blocking status lookup
     }
   },
 
@@ -223,6 +261,87 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
     get().fetchProducts({ pageNo });
   },
 
+  syncProductToShopify: async (product: ProductData) => {
+    const region = useRegionStore.getState().currentRegion;
+    set({ syncingProductId: product.code });
+
+    try {
+      const res = await fetch(`/api/proxy/${region}/sync-product`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          productId: product.code,
+          product,
+          region,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || `Sync failed with HTTP ${res.status}`);
+      }
+
+      const shopifyProductId = data.data?.shopifyProductId || null;
+      const numericId = shopifyProductId ? shopifyProductId.split("/").pop() : undefined;
+
+      set((state) => ({
+        syncingProductId: null,
+        syncedProductMap: {
+          ...state.syncedProductMap,
+          [product.code]: {
+            shopifyProductId,
+            shopifyNumericId: numericId,
+            isSynced: true,
+          },
+        },
+      }));
+      return { success: true, data: data.data };
+    } catch (err: unknown) {
+      set({ syncingProductId: null });
+      return {
+        success: false,
+        error: (err as Error)?.message || "Failed to sync product to Shopify",
+      };
+    }
+  },
+
+  deleteProductFromShopify: async (product: ProductData) => {
+    const region = useRegionStore.getState().currentRegion;
+    set({ deletingProductId: product.code });
+
+    try {
+      const res = await fetch(`/api/proxy/${region}/delete-product`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          productId: product.code,
+          trendsCode: product.code,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || `Deletion failed with HTTP ${res.status}`);
+      }
+
+      set((state) => {
+        const updated = { ...state.syncedProductMap };
+        delete updated[product.code];
+        return {
+          deletingProductId: null,
+          syncedProductMap: updated,
+        };
+      });
+      return { success: true };
+    } catch (err: unknown) {
+      set({ deletingProductId: null });
+      return {
+        success: false,
+        error: (err as Error)?.message || "Failed to delete product from Shopify",
+      };
+    }
+  },
+
   resetFilters: () => {
     set({ filters: DEFAULT_FILTERS });
     get().fetchProducts({ categoryNo: undefined, pageNo: 1, search: "" });
@@ -238,6 +357,9 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
       filters: DEFAULT_FILTERS,
       productsStatus: "idle",
       productsError: null,
+      syncingProductId: null,
+      deletingProductId: null,
+      syncedProductMap: {},
     });
   },
 }));

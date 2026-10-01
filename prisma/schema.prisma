@@ -32,3 +32,49 @@ model Session {
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
+
+model TrendProductSync {
+  id               String             @id @default(uuid())
+  shop             String
+  shopifyProductId String             @unique
+  trendsCode       String
+  region           String
+  syncLocks        String[]           @default([])
+  lastSyncedAt     DateTime           @default(now())
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  variants         TrendVariantSync[]
+
+  @@index([shop, trendsCode])
+}
+
+model TrendVariantSync {
+  id               String           @id @default(uuid())
+  productSyncId    String
+  shopifyVariantId String           @unique
+  stockCode        String
+  region           String
+  lastStockQty     Int              @default(0)
+  updatedAt        DateTime         @updatedAt
+
+  productSync      TrendProductSync @relation(fields: [productSyncId], references: [id], onDelete: Cascade)
+
+  @@index([stockCode, region])
+}
+
+model TrendOrderDispatch {
+  id               String   @id @default(uuid())
+  shop             String
+  shopifyOrderId   String   @unique
+  trendsOrderNum   String?
+  region           String
+  status           String   @default("pending")
+  payload          Json
+  errorMessage     String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([shop, status])
+}
+

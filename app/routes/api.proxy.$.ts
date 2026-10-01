@@ -1,8 +1,14 @@
 import type { LoaderFunctionArgs, ActionFunctionArgs } from "react-router";
-import type { Region, ApiProxyResponse } from "../../shared/types/trends.types";
+import type { Region, ApiProxyResponse, ProductData, ProductShowData } from "../../shared/types/trends.types";
 import { cacheAdapter, CacheKeyBuilder, DEFAULT_CACHE_CONFIG } from "../../server/cache";
 import { TrendsApiClient } from "../../server/api-client/trends-client";
+import {
+  syncTrendProductToShopify,
+  deleteTrendProductFromShopify,
+  getTrendProductSyncStatuses,
+} from "../../server/services/shopify-sync.service";
 import { authenticate } from "../shopify.server";
+import prisma from "../db.server";
 
 /**
  * Helper to parse region and endpoint path from request
@@ -54,11 +60,16 @@ function getEndpointTtl(endpoint: string): number {
 }
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
+  let shop = "demo.myshopify.com";
   // Optional admin authentication verification (supports embedded App Bridge)
   try {
-    await authenticate.admin(request);
+    const auth = await authenticate.admin(request);
+    shop = auth.session.shop;
   } catch {
-    // Pass through if not in Shopify admin frame or running local dev tests
+    const latestSession = await prisma.session.findFirst();
+    if (latestSession) {
+      shop = latestSession.shop;
+    }
   }
 
   const url = new URL(request.url);
@@ -69,6 +80,19 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       { success: false, error: "Missing upstream endpoint path" },
       { status: 400 }
     );
+  }
+
+  // Handle Sync Status Ledger Lookup
+  if (endpoint === "sync-status" || endpoint.startsWith("sync-status")) {
+    const codesParam = url.searchParams.get("codes");
+    const codes = codesParam ? codesParam.split(",").map((c) => c.trim()).filter(Boolean) : [];
+    const syncMap = await getTrendProductSyncStatuses(shop, codes);
+    return Response.json({
+      success: true,
+      region,
+      shop,
+      data: syncMap,
+    });
   }
 
   const ttl = getEndpointTtl(endpoint);
@@ -148,10 +172,18 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request, params }: ActionFunctionArgs) => {
+  let adminClient: any = undefined;
+  let shop = "demo.myshopify.com";
+
   try {
-    await authenticate.admin(request);
+    const auth = await authenticate.admin(request);
+    adminClient = auth.admin;
+    shop = auth.session.shop;
   } catch {
-    // Pass through
+    const latestSession = await prisma.session.findFirst();
+    if (latestSession) {
+      shop = latestSession.shop;
+    }
   }
 
   const url = new URL(request.url);
@@ -162,6 +194,101 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       { success: false, error: "Missing upstream endpoint path" },
       { status: 400 }
     );
+  }
+
+  // Handle Product Deletion from Shopify & Sync Ledger
+  if (endpoint === "delete-product" || (endpoint === "sync-product" && request.method === "DELETE")) {
+    try {
+      const body = (await request.json().catch(() => ({}))) as {
+        productId?: string;
+        trendsCode?: string;
+      };
+
+      const trendsCode = body.trendsCode || body.productId;
+      if (!trendsCode) {
+        return Response.json(
+          { success: false, error: "Missing productId or trendsCode for deletion" },
+          { status: 400 }
+        );
+      }
+
+      const deleteResult = await deleteTrendProductFromShopify({
+        admin: adminClient,
+        shop,
+        trendsCode: String(trendsCode),
+      });
+
+      return Response.json({
+        success: true,
+        region,
+        data: deleteResult,
+      });
+    } catch (delErr: unknown) {
+      const message = delErr instanceof Error ? delErr.message : "Deletion failed";
+      return Response.json(
+        {
+          success: false,
+          region,
+          error: message,
+        },
+        { status: 500 }
+      );
+    }
+  }
+
+  // Handle Shopify Catalog Product Synchronization
+  if (endpoint === "sync-product") {
+    try {
+      const body = (await request.json().catch(() => ({}))) as {
+        productId?: string;
+        product?: ProductData;
+        trendsProduct?: ProductData;
+        syncLocks?: string[];
+        isMock?: boolean;
+      };
+
+      let productToSync = body.product || body.trendsProduct;
+      if (!productToSync && body.productId) {
+        const showRes = await TrendsApiClient.request<ProductShowData>(region, `products/${body.productId}`);
+        productToSync = showRes.data?.data;
+      }
+
+      if (!productToSync) {
+        return Response.json(
+          { success: false, error: "Missing product data or productId for synchronization" },
+          { status: 400 }
+        );
+      }
+
+      const syncResult = await syncTrendProductToShopify({
+        admin: adminClient,
+        shop,
+        trendsProduct: productToSync,
+        region,
+        syncLocks: body.syncLocks,
+        isMock: body.isMock,
+      });
+
+      return Response.json({
+        success: true,
+        region,
+        cached: false,
+        timestamp: new Date().toISOString(),
+        data: syncResult,
+      });
+    } catch (syncErr: unknown) {
+      const message = syncErr instanceof Error ? syncErr.message : "Sync to Shopify failed";
+      return Response.json(
+        {
+          success: false,
+          region,
+          cached: false,
+          timestamp: new Date().toISOString(),
+          error: message,
+        },
+        { status: 500 }
+      );
+    }
   }
 
   try {

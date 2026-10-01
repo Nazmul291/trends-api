@@ -1,3 +1,50 @@
-.cache
-build
+# ==========================================
+# Docker Build Ignore Configuration
+# ==========================================
+
+# Dependencies & Lockfiles
 node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build & Compilation Artifacts
+build
+dist
+.cache
+.react-router
+.vite
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Git & Version Control
+.git
+.gitignore
+.gitattributes
+
+# IDE, Editor & Agent Workspaces
+.idea
+.vscode
+.cursor
+.gemini
+.agents
+AGENTS.md
+CLAUDE.md
+
+# Shopify CLI local cache & states
+.shopify
+
+# Documentation & Non-essential design files
+README.md
+CHANGELOG.md
+*.docx
+*.pdf
+*.md
+
+# Test & Linting caches
+.eslintcache
+coverage

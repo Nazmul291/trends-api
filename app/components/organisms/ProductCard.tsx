@@ -6,9 +6,24 @@ import { StockBadge } from "../molecules/StockBadge";
 export interface ProductCardProps {
   product: ProductData;
   onClick?: (product: ProductData) => void;
+  onSync?: (product: ProductData) => void;
+  isSyncing?: boolean;
+  isSynced?: boolean;
+  onDelete?: (product: ProductData) => void;
+  isDeleting?: boolean;
+  shopifyAdminUrl?: string;
 }
 
-export const ProductCard: React.FC<ProductCardProps> = ({ product, onClick }) => {
+export const ProductCard: React.FC<ProductCardProps> = ({
+  product,
+  onClick,
+  onSync,
+  isSyncing = false,
+  isSynced = false,
+  onDelete,
+  isDeleting = false,
+  shopifyAdminUrl,
+}) => {
   const primaryImage = product.images?.[0]?.link || "";
   const primaryPricing = product.pricing?.[0]?.prices?.[0]?.price;
   const [hasImageError, setHasImageError] = React.useState(false);
@@ -132,6 +147,28 @@ export const ProductCard: React.FC<ProductCardProps> = ({ product, onClick }) =>
         >
           {product.code}
         </div>
+
+        {isSynced && (
+          <div
+            style={{
+              position: "absolute",
+              top: "10px",
+              right: "10px",
+              backgroundColor: "#008060",
+              color: "#ffffff",
+              padding: "2px 8px",
+              borderRadius: "6px",
+              fontSize: "10px",
+              fontWeight: 700,
+              display: "flex",
+              alignItems: "center",
+              gap: "3px",
+              boxShadow: "0 1px 3px rgba(0,0,0,0.2)",
+            }}
+          >
+            ✓ Synced
+          </div>
+        )}
       </div>
 
       <div style={{ padding: "16px", display: "flex", flexDirection: "column", gap: "8px", flex: 1 }}>
@@ -181,23 +218,146 @@ export const ProductCard: React.FC<ProductCardProps> = ({ product, onClick }) =>
             paddingTop: "12px",
             borderTop: "1px solid #f1f2f3",
             display: "flex",
-            alignItems: "flex-end",
+            alignItems: "center",
             justifyContent: "space-between",
+            gap: "8px",
           }}
         >
-          {primaryPricing ? (
-            <PriceTag amount={primaryPricing} label="From" size="md" />
-          ) : (
-            <span style={{ fontSize: "12px", color: "#6d7175", fontWeight: 500 }}>
-              Price on request
-            </span>
-          )}
-          <StockBadge
-            quantity={totalStock}
-            nextShipment={nextShipment?.next_shipment}
-            dueDate={nextShipment?.due_date}
-            size="sm"
-          />
+          <div>
+            {primaryPricing ? (
+              <PriceTag amount={primaryPricing} label="From" size="md" />
+            ) : (
+              <span style={{ fontSize: "12px", color: "#6d7175", fontWeight: 500 }}>
+                Price on request
+              </span>
+            )}
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <StockBadge
+              quantity={totalStock}
+              nextShipment={nextShipment?.next_shipment}
+              dueDate={nextShipment?.due_date}
+              size="sm"
+            />
+            {isSynced ? (
+              <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                {shopifyAdminUrl && (
+                  <a
+                    href={shopifyAdminUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    onClick={(e) => e.stopPropagation()}
+                    title="Open in Shopify Admin"
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      width: "28px",
+                      height: "28px",
+                      borderRadius: "6px",
+                      border: "1px solid #cbe5d8",
+                      backgroundColor: "#f1f8f5",
+                      color: "#008060",
+                      textDecoration: "none",
+                      transition: "all 0.15s ease",
+                    }}
+                  >
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                      <polyline points="15 3 21 3 21 9" />
+                      <line x1="10" y1="14" x2="21" y2="3" />
+                    </svg>
+                  </a>
+                )}
+                {onDelete && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDelete(product);
+                    }}
+                    disabled={isDeleting}
+                    title="Delete product from Shopify"
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      width: "28px",
+                      height: "28px",
+                      borderRadius: "6px",
+                      border: "1px solid #fecaca",
+                      backgroundColor: isDeleting ? "#fee2e2" : "#ffffff",
+                      color: "#d82c0d",
+                      cursor: isDeleting ? "not-allowed" : "pointer",
+                      transition: "all 0.15s ease",
+                      padding: 0,
+                    }}
+                  >
+                    {isDeleting ? (
+                      <span
+                        style={{
+                          width: "12px",
+                          height: "12px",
+                          border: "2px solid #d82c0d",
+                          borderTopColor: "transparent",
+                          borderRadius: "50%",
+                          animation: "trends-spin 0.6s linear infinite",
+                        }}
+                      />
+                    ) : (
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <polyline points="3 6 5 6 21 6" />
+                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                      </svg>
+                    )}
+                  </button>
+                )}
+              </div>
+            ) : (
+              onSync && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onSync(product);
+                  }}
+                  disabled={isSyncing}
+                  title="Sync product to Shopify"
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    width: "28px",
+                    height: "28px",
+                    borderRadius: "6px",
+                    border: "1px solid #008060",
+                    backgroundColor: isSyncing ? "#e3f1df" : "#ffffff",
+                    color: "#008060",
+                    cursor: isSyncing ? "not-allowed" : "pointer",
+                    transition: "all 0.15s ease",
+                    padding: 0,
+                  }}
+                >
+                  {isSyncing ? (
+                    <span
+                      style={{
+                        width: "12px",
+                        height: "12px",
+                        border: "2px solid #008060",
+                        borderTopColor: "transparent",
+                        borderRadius: "50%",
+                        animation: "trends-spin 0.6s linear infinite",
+                      }}
+                    />
+                  ) : (
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+                    </svg>
+                  )}
+                </button>
+              )
+            )}
+          </div>
         </div>
       </div>
     </div>

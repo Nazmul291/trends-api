@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "vite",
+  "buildCommand": "npx prisma generate && npm run build",
+  "installCommand": "npm ci",
+  "env": {
+    "NODE_ENV": "production"
+  }
+}
