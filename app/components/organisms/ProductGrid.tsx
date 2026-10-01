@@ -12,9 +12,22 @@ export const ProductGrid: React.FC<ProductGridProps> = ({ onProductClick }) => {
   const products = useCatalogStore((s) => s.products);
   const status = useCatalogStore((s) => s.productsStatus);
   const error = useCatalogStore((s) => s.productsError);
+  const syncingProductId = useCatalogStore((s) => s.syncingProductId);
+  const deletingProductId = useCatalogStore((s) => s.deletingProductId);
+  const syncedProductMap = useCatalogStore((s) => s.syncedProductMap);
+  const syncProductToShopify = useCatalogStore((s) => s.syncProductToShopify);
+  const deleteProductFromShopify = useCatalogStore((s) => s.deleteProductFromShopify);
   const resetFilters = useCatalogStore((s) => s.resetFilters);
   const fetchProducts = useCatalogStore((s) => s.fetchProducts);
   const fetchCategories = useCatalogStore((s) => s.fetchCategories);
+
+  const handleDeleteProduct = (product: ProductData) => {
+    const confirmed = window.confirm(
+      `Delete "${product.name}" from your Shopify store?\n\nThis will permanently remove the Shopify product and all variants.`
+    );
+    if (!confirmed) return;
+    deleteProductFromShopify(product);
+  };
 
   const handleTryAgain = () => {
     fetchCategories({ bypassCache: true });
@@ -151,9 +164,29 @@ export const ProductGrid: React.FC<ProductGridProps> = ({ onProductClick }) => {
         width: "100%",
       }}
     >
-      {products.map((product) => (
-        <ProductCard key={product.code} product={product} onClick={onProductClick} />
-      ))}
+      {products.map((product) => {
+        const syncInfo = syncedProductMap[product.code];
+        const isSynced = Boolean(syncInfo?.isSynced);
+        const adminUrl = syncInfo?.shopifyNumericId
+          ? `shopify:admin/products/${syncInfo.shopifyNumericId}`
+          : syncInfo?.shopifyProductId
+          ? `shopify:admin/products/${syncInfo.shopifyProductId.split("/").pop()}`
+          : undefined;
+
+        return (
+          <ProductCard
+            key={product.code}
+            product={product}
+            onClick={onProductClick}
+            isSynced={isSynced}
+            shopifyAdminUrl={adminUrl}
+            onSync={(p) => syncProductToShopify(p)}
+            isSyncing={syncingProductId === product.code}
+            onDelete={handleDeleteProduct}
+            isDeleting={deletingProductId === product.code}
+          />
+        );
+      })}
     </div>
   );
 };

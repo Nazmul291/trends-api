@@ -4,6 +4,7 @@ export * from "./atoms/Skeleton";
 export * from "./atoms/PriceTag";
 export * from "./atoms/Button";
 export * from "./atoms/Input";
+export * from "./atoms/GlobalNavigationSpinner";
 
 // Molecules
 export * from "./molecules/RegionSelector";

@@ -32,6 +32,19 @@ export default function ProductDetailPage() {
 
   const leadTimes = useProductDetailStore((s) => s.leadTimes);
 
+  const syncStatus = useProductDetailStore((s) => s.syncStatus);
+  const syncError = useProductDetailStore((s) => s.syncError);
+  const syncResult = useProductDetailStore((s) => s.syncResult);
+  const syncProductToShopify = useProductDetailStore((s) => s.syncProductToShopify);
+
+  const isSynced = useProductDetailStore((s) => s.isSynced);
+  const shopifyProductId = useProductDetailStore((s) => s.shopifyProductId);
+  const shopifyNumericId = useProductDetailStore((s) => s.shopifyNumericId);
+  const shopifyShop = useProductDetailStore((s) => s.shopifyShop);
+  const deleteStatus = useProductDetailStore((s) => s.deleteStatus);
+  const deleteError = useProductDetailStore((s) => s.deleteError);
+  const deleteProductFromShopify = useProductDetailStore((s) => s.deleteProductFromShopify);
+
   const loadProductDetailsWithStock = useProductDetailStore(
     (s) => s.loadProductDetailsWithStock
   );
@@ -113,18 +126,205 @@ export default function ProductDetailPage() {
   const primaryPricing = product.pricing?.[0];
   const totalStock = stock.reduce((sum, item) => sum + (item.quantity || 0), 0);
 
+  const adminNumericId = shopifyNumericId || shopifyProductId?.split("/").pop();
+  const shopSubdomain = shopifyShop ? shopifyShop.replace(".myshopify.com", "") : null;
+  const adminProductUrl = adminNumericId
+    ? shopSubdomain
+      ? `https://admin.shopify.com/store/${shopSubdomain}/products/${adminNumericId}`
+      : `shopify:admin/products/${adminNumericId}`
+    : null;
+
+  const handleDeleteProduct = async () => {
+    const confirmed = window.confirm(
+      `Are you sure you want to delete "${product.name}" from your Shopify store?\n\nThis will permanently remove the Shopify product and linked variants.`
+    );
+    if (!confirmed) return;
+    await deleteProductFromShopify();
+  };
+
   return (
     <div style={{ padding: "24px", maxWidth: "1280px", margin: "0 auto", display: "flex", flexDirection: "column", gap: "24px" }}>
-      {/* Top Breadcrumb Bar */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      {/* Top Breadcrumb & Action Bar */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "12px" }}>
         <Button variant="outline" size="sm" onClick={() => navigate("/app")}>
           ← Back to Catalog
         </Button>
-        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
           <StatusBadge label={`Region: ${currentRegion.toUpperCase()}`} tone="info" size="sm" />
-          <StatusBadge label={product.code} tone="neutral" size="sm" />
+          <StatusBadge label={`Code: ${product.code}`} tone="neutral" size="sm" />
+
+          {isSynced ? (
+            <>
+              <StatusBadge label="✓ Synced to Shopify" tone="success" size="sm" />
+              {adminProductUrl && (
+                <a
+                  href={adminProductUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "4px",
+                    padding: "6px 12px",
+                    borderRadius: "8px",
+                    backgroundColor: "#f1f8f5",
+                    color: "#008060",
+                    border: "1px solid #cbe5d8",
+                    fontSize: "12px",
+                    fontWeight: 600,
+                    textDecoration: "none",
+                    transition: "all 0.15s ease",
+                  }}
+                >
+                  View in Admin ↗
+                </a>
+              )}
+              <Button
+                variant="destructive"
+                size="sm"
+                loading={deleteStatus === "loading"}
+                onClick={handleDeleteProduct}
+                icon={
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="3 6 5 6 21 6" />
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                  </svg>
+                }
+              >
+                {deleteStatus === "loading" ? "Deleting..." : "Delete from Shopify"}
+              </Button>
+            </>
+          ) : (
+            <Button
+              variant="primary"
+              size="sm"
+              loading={syncStatus === "loading"}
+              onClick={() => syncProductToShopify()}
+              icon={
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+                </svg>
+              }
+            >
+              {syncStatus === "loading" ? "Syncing to Shopify..." : "Sync to Shopify"}
+            </Button>
+          )}
         </div>
       </div>
+
+      {/* Sync Status Banner */}
+      {syncStatus === "success" && syncResult && (
+        <div
+          style={{
+            backgroundColor: "#f0fdf4",
+            border: "1px solid #bbf7d0",
+            borderRadius: "10px",
+            padding: "14px 18px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            boxShadow: "0 1px 3px rgba(0,0,0,0.03)",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+            <span style={{ fontSize: "20px" }}>✅</span>
+            <div>
+              <div style={{ fontSize: "14px", fontWeight: 700, color: "#166534" }}>
+                Product successfully {syncResult.action === "created" ? "created in" : "updated on"} Shopify!
+              </div>
+              <div style={{ fontSize: "12px", color: "#15803d", marginTop: "2px" }}>
+                Shopify ID: <code>{syncResult.shopifyProductId}</code> • {syncResult.skuList.length} canonical SKUs provisioned (Region: {currentRegion.toUpperCase()})
+              </div>
+            </div>
+          </div>
+          {syncResult.shopifyProductId && (
+            <a
+              href={`shopify:admin/products/${syncResult.shopifyProductId.split("/").pop()}`}
+              target="_blank"
+              rel="noreferrer"
+              style={{
+                fontSize: "12px",
+                fontWeight: 600,
+                color: "#166534",
+                textDecoration: "underline",
+                padding: "6px 12px",
+                backgroundColor: "#dcfce7",
+                borderRadius: "6px",
+              }}
+            >
+              Open in Shopify Admin ↗
+            </a>
+          )}
+        </div>
+      )}
+
+      {syncStatus === "error" && syncError && (
+        <div
+          style={{
+            backgroundColor: "#fef2f2",
+            border: "1px solid #fecaca",
+            borderRadius: "10px",
+            padding: "14px 18px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+            <span style={{ fontSize: "20px" }}>❌</span>
+            <div>
+              <div style={{ fontSize: "14px", fontWeight: 700, color: "#991b1b" }}>
+                Failed to sync product to Shopify
+              </div>
+              <div style={{ fontSize: "12px", color: "#b91c1c", marginTop: "2px" }}>
+                {syncError}
+              </div>
+            </div>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => syncProductToShopify()}
+            style={{ color: "#991b1b", borderColor: "#fca5a5" }}
+          >
+            Retry Sync
+          </Button>
+        </div>
+      )}
+
+      {deleteStatus === "error" && deleteError && (
+        <div
+          style={{
+            backgroundColor: "#fef2f2",
+            border: "1px solid #fecaca",
+            borderRadius: "10px",
+            padding: "14px 18px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+            <span style={{ fontSize: "20px" }}>⚠️</span>
+            <div>
+              <div style={{ fontSize: "14px", fontWeight: 700, color: "#991b1b" }}>
+                Failed to delete product from Shopify
+              </div>
+              <div style={{ fontSize: "12px", color: "#b91c1c", marginTop: "2px" }}>
+                {deleteError}
+              </div>
+            </div>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleDeleteProduct}
+            style={{ color: "#991b1b", borderColor: "#fca5a5" }}
+          >
+            Retry Delete
+          </Button>
+        </div>
+      )}
 
       {/* Main Product Layout */}
       <div

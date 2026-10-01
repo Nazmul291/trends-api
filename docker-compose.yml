@@ -1,0 +1,90 @@
+name: trends-api
+
+services:
+  # ==========================================
+  # PostgreSQL Service
+  # ==========================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: trends_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-trends_api}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-trends_api}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ==========================================
+  # Redis In-Memory Cache Service
+  # ==========================================
+  redis:
+    image: redis:7-alpine
+    container_name: trends_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 3s
+
+  # ==========================================
+  # Shopify Remix Web Application Service
+  # ==========================================
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trends_web_app
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Runtime config
+      NODE_ENV: production
+      PORT: 3000
+
+      # Database & Persistence (internal Docker network bridge)
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/trends_api?schema=public}
+
+      # In-Memory / Distributed Caching
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+
+      # Shopify Partner Credentials & App Configuration
+      SHOPIFY_API_KEY: ${SHOPIFY_API_KEY}
+      SHOPIFY_API_SECRET: ${SHOPIFY_API_SECRET}
+      SCOPES: ${SCOPES:-write_metaobject_definitions,write_metaobjects,write_products,read_locations,write_inventory,read_inventory}
+      HOST: ${HOST:-${SHOPIFY_APP_URL:-http://localhost:3000}}
+      SHOPIFY_APP_URL: ${SHOPIFY_APP_URL:-${HOST:-http://localhost:3000}}
+
+      # Regional Supplier Gateway (TRENDS API)
+      TRENDS_API_KEY_NZ: ${TRENDS_API_KEY_NZ:-}
+      TRENDS_API_KEY_AU: ${TRENDS_API_KEY_AU:-}
+      TRENDS_API_KEY_SG: ${TRENDS_API_KEY_SG:-}
+      TRENDS_API_KEY: ${TRENDS_API_KEY:-}
+      ENABLE_TRENDS_MOCK_FALLBACK: ${ENABLE_TRENDS_MOCK_FALLBACK:-true}
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
