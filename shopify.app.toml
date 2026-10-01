@@ -2,12 +2,34 @@
 
 client_id = "9f79e1ab580c4a996ca2e6b6b3f62ddb"
 name = "TRENDS API"
-application_url = "https://example.com"
+application_url = "https://dev.nazmulcodes.org"
 embedded = true
+
+[build]
+automatically_update_urls_on_dev = true
+
+[webhooks]
+api_version = "2026-10"
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/scopes_update"
+  topics = [ "app/scopes_update" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = [ "app/uninstalled" ]
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_products,write_metaobjects,write_metaobject_definitions"
+scopes = "write_metaobject_definitions,write_metaobjects,write_products"
+
+[auth]
+redirect_urls = [
+  "https://dev.nazmulcodes.org/api/auth",
+  "https://dev.nazmulcodes.org/api/auth/callback",
+  "https://dev.nazmulcodes.org/auth/callback",
+  "https://dev.nazmulcodes.org/auth/shopify/callback"
+]
 
 [product.metafields.app.demo_info]
 type = "single_line_text_field"
@@ -17,36 +39,18 @@ description = "Tracks products created by the Shopify app template for developme
   [product.metafields.app.demo_info.access]
   admin = "merchant_read_write"
 
-[metaobjects.app.example]
-name = "Example"
-description = "An example metaobject definition created by this template"
+[metaobjects.app.trends_api]
+name = "TRENDS API"
+description = "A metaobject definition created for TRENDS API"
 
-  [metaobjects.app.example.access]
+  [metaobjects.app.trends_api.access]
   admin = "merchant_read_write"
 
-[metaobjects.app.example.fields.title]
+[metaobjects.app.trends_api.fields.title]
 name = "Title"
 type = "single_line_text_field"
 required = true
 
-[metaobjects.app.example.fields.description]
+[metaobjects.app.trends_api.fields.description]
 name = "Description"
 type = "multi_line_text_field"
-
-[webhooks]
-api_version = "2026-10"
-
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/app/uninstalled"
-  topics = [ "app/uninstalled" ]
-
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/app/scopes_update"
-  topics = [ "app/scopes_update" ]
-
-[auth]
-redirect_urls = [ "https://example.com/api/auth" ]
-
-[build]
-include_config_on_deploy = true
-automatically_update_urls_on_dev = true

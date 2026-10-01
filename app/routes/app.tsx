@@ -4,6 +4,7 @@ import { boundary } from "@shopify/shopify-app-react-router/server";
 import { AppProvider } from "@shopify/shopify-app-react-router/react";
 
 import { authenticate } from "../shopify.server";
+import { RegionSelector } from "../components/molecules/RegionSelector";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   await authenticate.admin(request);
@@ -18,10 +19,33 @@ export default function App() {
   return (
     <AppProvider apiKey={apiKey}>
       <s-app-nav>
-        <s-link href="/app">Home</s-link>
-        <s-link href="/app/additional">Additional page</s-link>
+        <s-link href="/app">Product Catalog</s-link>
+        <s-link href="/app/orders">Orders & Tracking</s-link>
       </s-app-nav>
-      <Outlet />
+
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          padding: "16px 24px",
+          backgroundColor: "#ffffff",
+          borderBottom: "1px solid #e1e3e5",
+          marginBottom: "16px",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+          <span style={{ fontSize: "20px" }}>⚡</span>
+          <span style={{ fontSize: "16px", fontWeight: 700, color: "#202223" }}>
+            TRENDS Promotional Gateway
+          </span>
+        </div>
+        <RegionSelector />
+      </div>
+
+      <div style={{ padding: "0 24px 32px 24px" }}>
+        <Outlet />
+      </div>
     </AppProvider>
   );
 }
