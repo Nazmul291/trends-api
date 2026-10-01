@@ -10,7 +10,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-trends_api}
     ports:
       - "5432:5432"
@@ -64,7 +64,7 @@ services:
       PORT: 3000
 
       # Database & Persistence (internal Docker network bridge)
-      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/trends_api?schema=public}
+      DATABASE_URL: ${DATABASE_URL}
 
       # In-Memory / Distributed Caching
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}

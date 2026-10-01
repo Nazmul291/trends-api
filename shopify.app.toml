@@ -2,7 +2,7 @@
 
 client_id = "9f79e1ab580c4a996ca2e6b6b3f62ddb"
 name = "TRENDS API"
-application_url = "https://dev.nazmulcodes.org"
+application_url = "https://trends-api-mu.vercel.app"
 embedded = true
 
 [build]
@@ -25,10 +25,10 @@ scopes = "write_metaobject_definitions,write_metaobjects,write_products,read_loc
 
 [auth]
 redirect_urls = [
-  "https://dev.nazmulcodes.org/api/auth",
-  "https://dev.nazmulcodes.org/api/auth/callback",
-  "https://dev.nazmulcodes.org/auth/callback",
-  "https://dev.nazmulcodes.org/auth/shopify/callback"
+  "https://trends-api-mu.vercel.app/api/auth",
+  "https://trends-api-mu.vercel.app/api/auth/callback",
+  "https://trends-api-mu.vercel.app/auth/callback",
+  "https://trends-api-mu.vercel.app/auth/shopify/callback"
 ]
 
 [product.metafields.app.demo_info]
