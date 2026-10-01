@@ -37,7 +37,7 @@ if (host === "localhost") {
 
 export default defineConfig({
   server: {
-    allowedHosts: [host, "dev.nazmulcodes.org", "localhost"],
+    allowedHosts: [host, "dev.nazmulcodes.org", "localhost", "trends-api-mu.vercel.app"],
     cors: {
       preflightContinue: true,
     },

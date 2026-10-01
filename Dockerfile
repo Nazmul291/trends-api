@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-ARG NODE_VERSION=20-alpine
+ARG NODE_VERSION=24-alpine
 
 # ==========================================
 # STAGE 1: Dependencies (deps)
