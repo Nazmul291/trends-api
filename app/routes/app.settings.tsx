@@ -1093,7 +1093,7 @@ export default function SettingsPage() {
               }}
             >
               <span>Endpoint: <code>/api/cron/sync-chunk</code></span>
-              <span>Vercel Cron: <code>*/10 * * * *</code></span>
+              <span>Cron Schedule: <code>0 2 * * *</code> (Daily on Hobby / Pro or External for frequent)</span>
             </div>
           </div>
         </div>

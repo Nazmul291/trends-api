@@ -3,7 +3,7 @@
   "crons": [
     {
       "path": "/api/cron/sync-chunk",
-      "schedule": "*/10 * * * *"
+      "schedule": "0 2 * * *"
     }
   ]
 }
