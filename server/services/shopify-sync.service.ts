@@ -725,9 +725,10 @@ export async function syncInventoryQuantities(
         inventoryItemId: item.inventoryItemId,
         locationId: validLoc,
         quantity: Math.max(0, parseInt(String(item.quantity), 10) || 0),
+        changeFromQuantity: null,
       };
     })
-    .filter((q): q is { inventoryItemId: string; locationId: string; quantity: number } => q !== null);
+    .filter((q): q is { inventoryItemId: string; locationId: string; quantity: number; changeFromQuantity: null } => q !== null);
 
   if (quantitiesInput.length === 0) {
     console.warn("[Shopify Sync] No valid inventory quantities to set (all location IDs invalid).");
@@ -757,7 +758,6 @@ export async function syncInventoryQuantities(
           input: {
             name: "available",
             reason: "correction",
-            ignoreCompareQuantity: true,
             quantities: quantitiesInput,
           },
         },
@@ -836,12 +836,12 @@ export async function syncInventoryQuantities(
                 input: {
                   name: "available",
                   reason: "correction",
-                  ignoreCompareQuantity: true,
                   quantities: [
                     {
                       inventoryItemId: item.inventoryItemId,
                       locationId: validLocId,
                       quantity: Math.max(0, parseInt(String(item.quantity), 10) || 0),
+                      changeFromQuantity: null,
                     },
                   ],
                 },
@@ -932,12 +932,12 @@ export async function syncInventoryQuantities(
               input: {
                 name: "available",
                 reason: "correction",
-                ignoreCompareQuantity: true,
                 quantities: [
                   {
                     inventoryItemId: item.inventoryItemId,
                     locationId: validLocId,
                     quantity: Math.max(0, parseInt(String(item.quantity), 10) || 0),
+                    changeFromQuantity: null,
                   },
                 ],
               },
