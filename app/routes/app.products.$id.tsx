@@ -9,6 +9,7 @@ import { PriceTag } from "../components/atoms/PriceTag";
 import { Button } from "../components/atoms/Button";
 import { Skeleton } from "../components/atoms/Skeleton";
 import { StockBadge } from "../components/molecules/StockBadge";
+import { ThumbnailCarousel } from "../components/molecules/ThumbnailCarousel";
 import { LeadTimeIndicator } from "../components/molecules/LeadTimeIndicator";
 import { formatCurrency } from "../../shared/utils/formatters";
 import type { ProductData, StockItemData } from "../../shared/types/trends.types";
@@ -463,34 +464,12 @@ export default function ProductDetailPage() {
             )}
           </div>
 
-          {images.length > 1 && (
-            <div style={{ display: "flex", gap: "8px", overflowX: "auto", paddingBottom: "4px" }}>
-              {images.map((img, idx) => (
-                <button
-                  key={idx}
-                  type="button"
-                  onClick={() => setActiveImageIndex(idx)}
-                  style={{
-                    width: "64px",
-                    height: "64px",
-                    borderRadius: "8px",
-                    border: `2px solid ${activeImageIndex === idx ? "#008060" : "#e1e3e5"}`,
-                    backgroundColor: "#f9fafb",
-                    padding: "2px",
-                    cursor: "pointer",
-                    overflow: "hidden",
-                    flexShrink: 0,
-                  }}
-                >
-                  <img
-                    src={img.link}
-                    alt=""
-                    style={{ width: "100%", height: "100%", objectFit: "contain" }}
-                  />
-                </button>
-              ))}
-            </div>
-          )}
+          <ThumbnailCarousel
+            images={images}
+            activeImageIndex={activeImageIndex}
+            onSelectImage={setActiveImageIndex}
+            productName={product.name}
+          />
         </div>
 
         {/* Right Column: Product Attributes & Pricing */}
