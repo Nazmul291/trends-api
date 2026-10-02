@@ -539,6 +539,57 @@ export function toValidShopifyLocationGid(locId: unknown): string | null {
 }
 
 /**
+ * Safely executes a Shopify GraphQL operation with automatic cost-throttle inspection and backoff.
+ */
+export async function executeShopifyGraphql<T = any>(
+  admin: { graphql: (query: string, options?: { variables?: Record<string, unknown> }) => Promise<Response> },
+  query: string,
+  options?: { variables?: Record<string, unknown> }
+): Promise<{ data?: T; errors?: any[]; extensions?: any; status: number }> {
+  try {
+    const res = await admin.graphql(query, options);
+    const json = (await res.json()) as { data?: T; errors?: any[]; extensions?: any };
+
+    // Inspect GraphQL cost extensions for throttle status
+    const throttle = json.extensions?.cost?.throttleStatus;
+    if (throttle && typeof throttle.currentlyAvailable === "number") {
+      if (throttle.currentlyAvailable < 150) {
+        const restoreRate = Math.max(10, throttle.restoreRate || 50);
+        const needed = 250 - throttle.currentlyAvailable;
+        const sleepMs = Math.min(2000, Math.max(200, Math.ceil((needed / restoreRate) * 1000)));
+        console.info(
+          `[Shopify Sync] Throttle protection: currentlyAvailable is ${throttle.currentlyAvailable}, backing off for ${sleepMs}ms`
+        );
+        await new Promise((resolve) => setTimeout(resolve, sleepMs));
+      }
+    }
+
+    // Check for THROTTLED status
+    const isThrottled =
+      res.status === 429 ||
+      (Array.isArray(json.errors) &&
+        json.errors.some(
+          (e: any) =>
+            e.extensions?.code === "THROTTLED" ||
+            (typeof e.message === "string" && e.message.toLowerCase().includes("throttled"))
+        ));
+
+    if (isThrottled) {
+      console.warn("[Shopify Sync] Request throttled by Shopify. Backing off for 1200ms before retrying once...");
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      const retryRes = await admin.graphql(query, options);
+      const retryJson = await retryRes.json();
+      return { ...retryJson, status: retryRes.status };
+    }
+
+    return { ...json, status: res.status };
+  } catch (networkErr: any) {
+    console.warn("[Shopify Sync] GraphQL network exception:", networkErr);
+    throw networkErr;
+  }
+}
+
+/**
  * Checks if an inventory item already has an active inventory level at the given location GID.
  */
 export async function isInventoryItemActiveAtLocation(
@@ -548,7 +599,8 @@ export async function isInventoryItemActiveAtLocation(
 ): Promise<boolean> {
   if (!inventoryItemId || !locationId) return false;
   try {
-    const res = await admin.graphql(
+    const res = await executeShopifyGraphql(
+      admin,
       `#graphql
       query getInventoryItemLevels($id: ID!) {
         inventoryItem(id: $id) {
@@ -567,8 +619,7 @@ export async function isInventoryItemActiveAtLocation(
         variables: { id: inventoryItemId },
       }
     );
-    const json = await res.json();
-    const levels = json?.data?.inventoryItem?.inventoryLevels?.nodes || [];
+    const levels = res?.data?.inventoryItem?.inventoryLevels?.nodes || [];
     return levels.some((lvl: any) => lvl?.location?.id === locationId);
   } catch (err) {
     console.warn(`[Shopify Sync] Could not check active inventory levels for item ${inventoryItemId}:`, formatGraphQLErrors(err));
@@ -577,15 +628,15 @@ export async function isInventoryItemActiveAtLocation(
 }
 
 /**
- * Explicitly enables inventory tracking and assigns available stock quantities
- * at the target warehouse location(s) using Shopify Admin GraphQL.
+ * Explicitly assigns available stock quantities at the target warehouse location(s)
+ * using a single batched Shopify Admin GraphQL inventorySetQuantities mutation.
  */
 export async function syncInventoryQuantities(
   admin: { graphql: (query: string, options?: { variables?: Record<string, unknown> }) => Promise<Response> },
   locationId: string,
   items: InventorySyncItem[]
 ): Promise<void> {
-  // Validate items: must have non-empty inventoryItemId and valid quantity
+  // 1. Validate items
   const validItems = items.filter((it) => {
     if (!it.inventoryItemId || typeof it.inventoryItemId !== "string") return false;
     if (it.inventoryItemId.includes("ProductVariant")) {
@@ -599,123 +650,7 @@ export async function syncInventoryQuantities(
 
   if (validItems.length === 0) return;
 
-  // Log parsed stock values before sending mutation
-  for (const item of validItems) {
-    const safeQty = Math.max(0, parseInt(String(item.quantity), 10) || 0);
-    const rawLoc = item.locationId || locationId;
-    const validatedLoc = toValidShopifyLocationGid(rawLoc);
-    console.info(
-      `[Sync Logger] Variant SKU: ${item.sku || item.inventoryItemId}, Location: ${validatedLoc || rawLoc}, Extracted Stock: ${safeQty}`
-    );
-  }
-
-  // 1. Explicitly enable inventory tracking on each variant's inventory item
-  const uniqueInventoryItemIds = Array.from(new Set(validItems.map((it) => it.inventoryItemId)));
-  await Promise.allSettled(
-    uniqueInventoryItemIds.map(async (invId) => {
-      try {
-        const trackRes = await admin.graphql(
-          `#graphql
-          mutation enableInventoryTracking($id: ID!, $input: InventoryItemInput!) {
-            inventoryItemUpdate(id: $id, input: $input) {
-              inventoryItem {
-                id
-                tracked
-              }
-              userErrors {
-                field
-                message
-              }
-            }
-          }`,
-          {
-            variables: {
-              id: invId,
-              input: {
-                tracked: true,
-              },
-            },
-          }
-        );
-        const trackJson = await trackRes.json();
-        const trackErrors = trackJson?.errors || trackJson?.data?.inventoryItemUpdate?.userErrors || [];
-        if (trackErrors.length > 0) {
-          console.warn("[Shopify Sync] enableInventoryTracking warning for item", invId, formatGraphQLErrors(trackErrors));
-        }
-      } catch (trackErr) {
-        console.warn("[Shopify Sync] enableInventoryTracking exception for item", invId, formatGraphQLErrors(trackErr));
-      }
-    })
-  );
-
-  // 2. Pre-activate each inventory item at all assigned target locations (only for valid GIDs)
-  const itemLocationMap = new Map<string, Set<string>>();
-  for (const item of validItems) {
-    const rawLoc = item.locationId || locationId;
-    const validLoc = toValidShopifyLocationGid(rawLoc);
-    if (validLoc) {
-      if (!itemLocationMap.has(item.inventoryItemId)) {
-        itemLocationMap.set(item.inventoryItemId, new Set());
-      }
-      itemLocationMap.get(item.inventoryItemId)!.add(validLoc);
-    } else {
-      console.warn(`[Shopify Sync] Ignoring unresolvable location ID "${rawLoc}" for item ${item.inventoryItemId}`);
-    }
-  }
-
-  await Promise.allSettled(
-    Array.from(itemLocationMap.entries()).map(async ([invId, locSet]) => {
-      try {
-        const locationsToActivate: Array<{ locationId: string; activate: boolean }> = [];
-        for (const loc of locSet) {
-          const alreadyActive = await isInventoryItemActiveAtLocation(admin, invId, loc);
-          if (!alreadyActive) {
-            locationsToActivate.push({ locationId: loc, activate: true });
-          }
-        }
-
-        if (locationsToActivate.length === 0) {
-          return;
-        }
-
-        const actRes = await admin.graphql(
-          `#graphql
-          mutation activateInventoryAtLocations($inventoryItemId: ID!, $inventoryItemUpdates: [InventoryBulkToggleActivationInput!]!) {
-            inventoryBulkToggleActivation(inventoryItemId: $inventoryItemId, inventoryItemUpdates: $inventoryItemUpdates) {
-              inventoryItem {
-                id
-              }
-              userErrors {
-                field
-                message
-              }
-            }
-          }`,
-          {
-            variables: {
-              inventoryItemId: invId,
-              inventoryItemUpdates: locationsToActivate,
-            },
-          }
-        );
-        const actJson = await actRes.json();
-        const actErrors = actJson?.errors || actJson?.data?.inventoryBulkToggleActivation?.userErrors || [];
-        if (actErrors.length > 0) {
-          console.warn(
-            `[Shopify Sync] activateInventoryAtLocations warning for item ${invId}:`,
-            formatGraphQLErrors(actErrors)
-          );
-        }
-      } catch (actErr) {
-        console.warn(
-          `[Shopify Sync] activateInventoryAtLocations exception for item ${invId}:`,
-          formatGraphQLErrors(actErr)
-        );
-      }
-    })
-  );
-
-  // 3. Set available inventory quantities via inventorySetQuantities
+  // 2. Prepare all quantities for a single batch inventorySetQuantities mutation
   const quantitiesInput = validItems
     .map((item) => {
       const rawLoc = item.locationId || locationId;
@@ -728,76 +663,125 @@ export async function syncInventoryQuantities(
         changeFromQuantity: null,
       };
     })
-    .filter((q): q is { inventoryItemId: string; locationId: string; quantity: number; changeFromQuantity: null } => q !== null);
+    .filter(
+      (q): q is { inventoryItemId: string; locationId: string; quantity: number; changeFromQuantity: null } =>
+        q !== null
+    );
 
   if (quantitiesInput.length === 0) {
     console.warn("[Shopify Sync] No valid inventory quantities to set (all location IDs invalid).");
     return;
   }
 
-  try {
-    const setRes = await admin.graphql(
-      `#graphql
-      mutation inventorySetQuantities($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
-        inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
-          inventoryAdjustmentGroup {
-            changes {
-              name
-              delta
-              quantityAfterChange
+  // 3. Batch inventorySetQuantities mutation in chunks of up to 100 items (Shopify allows up to 250 quantities per mutation)
+  const BATCH_SIZE = 100;
+  for (let i = 0; i < quantitiesInput.length; i += BATCH_SIZE) {
+    const chunkQuantities = quantitiesInput.slice(i, i + BATCH_SIZE);
+
+    try {
+      const setJson = await executeShopifyGraphql(
+        admin,
+        `#graphql
+        mutation inventorySetQuantities($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
+          inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
+            inventoryAdjustmentGroup {
+              changes {
+                name
+                delta
+                quantityAfterChange
+              }
+            }
+            userErrors {
+              field
+              message
             }
           }
-          userErrors {
-            field
-            message
-          }
-        }
-      }`,
-      {
-        variables: {
-          input: {
-            name: "available",
-            reason: "correction",
-            quantities: quantitiesInput,
+        }`,
+        {
+          variables: {
+            input: {
+              name: "available",
+              reason: "correction",
+              quantities: chunkQuantities,
+            },
+            idempotencyKey: randomUUID(),
           },
-          idempotencyKey: randomUUID(),
-        },
-      }
-    );
-
-    const setJson = await setRes.json();
-    const topErrors = setJson?.errors || [];
-    const userErrors: Array<{ field?: string[]; message: string }> =
-      setJson?.data?.inventorySetQuantities?.userErrors || [];
-    const changes = setJson?.data?.inventorySetQuantities?.inventoryAdjustmentGroup?.changes || [];
-
-    if (topErrors.length > 0 || userErrors.length > 0) {
-      const allErrors = [...topErrors, ...userErrors];
-      console.warn(
-        `[Sync Logger] Shopify inventorySetQuantities batch error:`,
-        formatGraphQLErrors(allErrors)
+        }
       );
 
-      // Fallback: Retry setting quantities individually with location activation
-      for (const item of validItems) {
-        const rawLocation = item.locationId || locationId;
-        const validLocId = toValidShopifyLocationGid(rawLocation);
-        if (!validLocId) {
-          console.warn(
-            `[Shopify Sync] Skipping individual fallback for item ${item.inventoryItemId}: location "${rawLocation}" is not a valid Shopify Location GID.`
-          );
-          continue;
-        }
+      const topErrors = setJson?.errors || [];
+      const userErrors: Array<{ field?: string[]; message: string }> =
+        setJson?.data?.inventorySetQuantities?.userErrors || [];
+      const changes = setJson?.data?.inventorySetQuantities?.inventoryAdjustmentGroup?.changes || [];
 
-        try {
-          const alreadyActive = await isInventoryItemActiveAtLocation(admin, item.inventoryItemId, validLocId);
-          if (!alreadyActive) {
-            const actRes = await admin.graphql(
+      if (topErrors.length > 0 || userErrors.length > 0) {
+        const allErrors = [...topErrors, ...userErrors];
+        console.warn(
+          `[Sync Logger] Shopify inventorySetQuantities batch warnings/errors:`,
+          formatGraphQLErrors(allErrors)
+        );
+
+        // Check if any error is due to unstocked items at location
+        const unstockedItemErrors = userErrors.filter(
+          (u) =>
+            u.message?.toLowerCase().includes("not stocked") ||
+            u.message?.toLowerCase().includes("location") ||
+            u.message?.toLowerCase().includes("tracked")
+        );
+
+        if (unstockedItemErrors.length > 0) {
+          // Identify unstocked items and activate them in parallel
+          const itemsToActivateMap = new Map<string, Set<string>>();
+          for (const item of chunkQuantities) {
+            if (!itemsToActivateMap.has(item.inventoryItemId)) {
+              itemsToActivateMap.set(item.inventoryItemId, new Set());
+            }
+            itemsToActivateMap.get(item.inventoryItemId)!.add(item.locationId);
+          }
+
+          // Activate locations in parallel
+          await Promise.allSettled(
+            Array.from(itemsToActivateMap.entries()).map(async ([invId, locSet]) => {
+              try {
+                await executeShopifyGraphql(
+                  admin,
+                  `#graphql
+                  mutation activateInventoryAtLocations($inventoryItemId: ID!, $inventoryItemUpdates: [InventoryBulkToggleActivationInput!]!) {
+                    inventoryBulkToggleActivation(inventoryItemId: $inventoryItemId, inventoryItemUpdates: $inventoryItemUpdates) {
+                      inventoryItem {
+                        id
+                      }
+                      userErrors {
+                        field
+                        message
+                      }
+                    }
+                  }`,
+                  {
+                    variables: {
+                      inventoryItemId: invId,
+                      inventoryItemUpdates: Array.from(locSet).map((loc) => ({ locationId: loc, activate: true })),
+                    },
+                  }
+                );
+              } catch (actErr) {
+                console.warn(`[Shopify Sync] Could not activate item ${invId} at locations:`, actErr);
+              }
+            })
+          );
+
+          // Retry inventorySetQuantities ONCE in a single batch
+          try {
+            await executeShopifyGraphql(
+              admin,
               `#graphql
-              mutation retryLocationActivation($inventoryItemId: ID!, $inventoryItemUpdates: [InventoryBulkToggleActivationInput!]!) {
-                inventoryBulkToggleActivation(inventoryItemId: $inventoryItemId, inventoryItemUpdates: $inventoryItemUpdates) {
-                  inventoryItem {
-                    id
+              mutation retryInventorySetQuantities($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
+                inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
+                  inventoryAdjustmentGroup {
+                    changes {
+                      name
+                      quantityAfterChange
+                    }
                   }
                   userErrors {
                     field
@@ -807,168 +791,26 @@ export async function syncInventoryQuantities(
               }`,
               {
                 variables: {
-                  inventoryItemId: item.inventoryItemId,
-                  inventoryItemUpdates: [{ locationId: validLocId, activate: true }],
-                },
-              }
-            );
-            const actJson = await actRes.json();
-            const actErrors = actJson?.errors || actJson?.data?.inventoryBulkToggleActivation?.userErrors || [];
-            if (actErrors.length > 0) {
-              console.warn(
-                `[Shopify Sync] retryLocationActivation failed for item ${item.inventoryItemId} at ${validLocId}:`,
-                formatGraphQLErrors(actErrors)
-              );
-            }
-          }
-
-          const setIndRes = await admin.graphql(
-            `#graphql
-            mutation retryIndividualSetQuantity($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
-              inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
-                userErrors {
-                  field
-                  message
-                }
-              }
-            }`,
-            {
-              variables: {
-                input: {
-                  name: "available",
-                  reason: "correction",
-                  quantities: [
-                    {
-                      inventoryItemId: item.inventoryItemId,
-                      locationId: validLocId,
-                      quantity: Math.max(0, parseInt(String(item.quantity), 10) || 0),
-                      changeFromQuantity: null,
-                    },
-                  ],
-                },
-                idempotencyKey: randomUUID(),
-              },
-            }
-          );
-          const setIndJson = await setIndRes.json();
-          const indErrors = setIndJson?.errors || setIndJson?.data?.inventorySetQuantities?.userErrors || [];
-          if (indErrors.length > 0) {
-            console.warn(
-              `[Shopify Sync] retryIndividualSetQuantity error for item ${item.inventoryItemId}:`,
-              formatGraphQLErrors(indErrors)
-            );
-          } else {
-            console.info(
-              `[Shopify Sync] Successfully set inventory quantity for item ${item.inventoryItemId} at ${validLocId}`
-            );
-          }
-        } catch (retryErr) {
-          console.warn(
-            `[Shopify Sync] Individual quantity fallback warning for item ${item.inventoryItemId}:`,
-            formatGraphQLErrors(retryErr)
-          );
-        }
-      }
-    } else {
-      const locSet = Array.from(new Set(quantitiesInput.map((it) => it.locationId)));
-      console.info(
-        `[Sync Logger] Successfully updated inventory for ${quantitiesInput.length} allocation(s) across ${locSet.length} location(s). Stock adjustments: ${changes.length}`
-      );
-    }
-  } catch (setErr) {
-    console.warn(
-      "[Shopify Sync] inventorySetQuantities batch error, attempting individual fallback:",
-      formatGraphQLErrors(setErr)
-    );
-    for (const item of validItems) {
-      const rawLocation = item.locationId || locationId;
-      const validLocId = toValidShopifyLocationGid(rawLocation);
-      if (!validLocId) {
-        console.warn(
-          `[Shopify Sync] Skipping fallback for item ${item.inventoryItemId}: location "${rawLocation}" is not a valid Shopify Location GID.`
-        );
-        continue;
-      }
-
-      try {
-        const isAlreadyActive = await isInventoryItemActiveAtLocation(admin, item.inventoryItemId, validLocId);
-        if (!isAlreadyActive) {
-          const actRes = await admin.graphql(
-            `#graphql
-            mutation fallbackLocationActivation($inventoryItemId: ID!, $inventoryItemUpdates: [InventoryBulkToggleActivationInput!]!) {
-              inventoryBulkToggleActivation(inventoryItemId: $inventoryItemId, inventoryItemUpdates: $inventoryItemUpdates) {
-                inventoryItem {
-                  id
-                }
-                userErrors {
-                  field
-                  message
-                }
-              }
-            }`,
-            {
-              variables: {
-                inventoryItemId: item.inventoryItemId,
-                inventoryItemUpdates: [{ locationId: validLocId, activate: true }],
-              },
-            }
-          );
-          const actJson = await actRes.json();
-          const actErrors = actJson?.errors || actJson?.data?.inventoryBulkToggleActivation?.userErrors || [];
-          if (actErrors.length > 0) {
-            console.warn(
-              `[Shopify Sync] fallbackLocationActivation error for item ${item.inventoryItemId} at ${validLocId}:`,
-              formatGraphQLErrors(actErrors)
-            );
-          }
-        }
-
-        const setRes = await admin.graphql(
-          `#graphql
-          mutation fallbackIndividualSetQuantity($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
-            inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
-              userErrors {
-                field
-                message
-              }
-            }
-          }`,
-          {
-            variables: {
-              input: {
-                name: "available",
-                reason: "correction",
-                quantities: [
-                  {
-                    inventoryItemId: item.inventoryItemId,
-                    locationId: validLocId,
-                    quantity: Math.max(0, parseInt(String(item.quantity), 10) || 0),
-                    changeFromQuantity: null,
+                  input: {
+                    name: "available",
+                    reason: "correction",
+                    quantities: chunkQuantities,
                   },
-                ],
-              },
-              idempotencyKey: randomUUID(),
-            },
+                  idempotencyKey: randomUUID(),
+                },
+              }
+            );
+          } catch (retryErr) {
+            console.warn("[Shopify Sync] Retry inventorySetQuantities warning:", retryErr);
           }
-        );
-        const setJson = await setRes.json();
-        const setErrors = setJson?.errors || setJson?.data?.inventorySetQuantities?.userErrors || [];
-        if (setErrors.length > 0) {
-          console.warn(
-            `[Shopify Sync] fallbackIndividualSetQuantity error for item ${item.inventoryItemId}:`,
-            formatGraphQLErrors(setErrors)
-          );
-        } else {
-          console.info(
-            `[Shopify Sync] Successfully set inventory quantity for fallback item ${item.inventoryItemId} at ${validLocId}`
-          );
         }
-      } catch (indErr) {
-        console.warn(
-          `[Shopify Sync] Individual inventory update fallback exception for item ${item.inventoryItemId}:`,
-          formatGraphQLErrors(indErr)
+      } else {
+        console.info(
+          `[Sync Logger] Successfully updated inventory for ${chunkQuantities.length} allocation(s). Stock adjustments: ${changes.length}`
         );
       }
+    } catch (setErr) {
+      console.warn("[Shopify Sync] inventorySetQuantities batch error:", formatGraphQLErrors(setErr));
     }
   }
 }
@@ -1497,7 +1339,8 @@ export async function assignVariantMedia(
   for (let i = 0; i < variantUpdates.length; i += CHUNK_SIZE) {
     const chunk = variantUpdates.slice(i, i + CHUNK_SIZE);
     try {
-      const bulkRes = await admin.graphql(
+      const bulkJson = await executeShopifyGraphql(
+        admin,
         `#graphql
         mutation bulkAssignVariantMedia($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
           productVariantsBulkUpdate(productId: $productId, variants: $variants) {
@@ -1517,7 +1360,6 @@ export async function assignVariantMedia(
           },
         }
       );
-      const bulkJson = await bulkRes.json();
       const bulkErrors = [...(bulkJson?.errors || []), ...(bulkJson?.data?.productVariantsBulkUpdate?.userErrors || [])];
       if (bulkErrors.length > 0) {
         console.warn(
@@ -1618,10 +1460,48 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
     }
   }
 
-  // 3. Extract base price & variant specifications
+  // 3. Extract base price & variant specifications with isolated per-variant fault handling
   const primaryPrice = extractBasePrice(trendsProduct, normalizedRegion);
-  const { optionName, specs } = buildVariantSpecs(trendsProduct, normalizedRegion, trendsCode);
-  const skuList: string[] = specs.map((s) => s.canonicalSku);
+  const { optionName, specs: rawSpecs } = buildVariantSpecs(trendsProduct, normalizedRegion, trendsCode);
+
+  const normalizedSpecs: VariantSpec[] = [];
+  for (const rawSpec of rawSpecs) {
+    try {
+      if (!rawSpec || !rawSpec.stockCode) {
+        console.warn(`[Shopify Sync] Skipping invalid variant spec (missing stockCode).`);
+        continue;
+      }
+      const cleanStockCode = toSafeString(rawSpec.stockCode).trim();
+      if (!cleanStockCode) continue;
+
+      const cleanOptionValue = toSafeString(rawSpec.optionValue || cleanStockCode).trim();
+      const cleanSku = toSafeString(
+        rawSpec.canonicalSku || `TR-${normalizedRegion.toUpperCase()}-${trendsCode}-${cleanStockCode}`
+      ).trim();
+      const cleanQty = Math.max(0, parseInt(String(rawSpec.quantity), 10) || 0);
+
+      normalizedSpecs.push({
+        stockCode: cleanStockCode,
+        optionValue: cleanOptionValue,
+        canonicalSku: cleanSku,
+        quantity: cleanQty,
+      });
+    } catch (specErr) {
+      console.warn(`[Shopify Sync] Fault isolation: error normalizing variant spec ${rawSpec?.stockCode}:`, specErr);
+    }
+  }
+
+  // Fallback if no specs survived normalization
+  if (normalizedSpecs.length === 0) {
+    normalizedSpecs.push({
+      stockCode: "DEFAULT",
+      optionValue: "Standard",
+      canonicalSku: `TR-${normalizedRegion.toUpperCase()}-${trendsCode}-DEFAULT`,
+      quantity: 0,
+    });
+  }
+
+  const skuList: string[] = normalizedSpecs.map((s) => s.canonicalSku);
   const variantLedgerEntries: {
     shopifyVariantId: string;
     inventoryItemId?: string;
@@ -1634,7 +1514,8 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
     // If not in local DB, check if product already exists in Shopify by tag/metafield
     if (!shopifyProductId) {
       try {
-        const findRes = await admin.graphql(
+        const findJson = await executeShopifyGraphql(
+          admin,
           `#graphql
           query findProductByTag($query: String!) {
             products(first: 1, query: $query) {
@@ -1643,7 +1524,7 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
                 handle
                 title
                 totalInventory
-                variants(first: 50) {
+                variants(first: 250) {
                   nodes {
                     id
                     sku
@@ -1666,7 +1547,6 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
             },
           }
         );
-        const findJson = await findRes.json();
         const found = findJson?.data?.products?.nodes?.[0];
         if (found?.id) {
           shopifyProductId = found.id;
@@ -1753,12 +1633,13 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
         productOptions: [
           {
             name: optionName,
-            values: specs.map((s) => ({ name: s.optionValue })),
+            values: Array.from(new Set(normalizedSpecs.map((s) => s.optionValue))).map((name) => ({ name })),
           },
         ],
       };
 
-      const createRes = await admin.graphql(
+      const createJson = await executeShopifyGraphql(
+        admin,
         `#graphql
         mutation productCreate($product: ProductCreateInput!) {
           productCreate(product: $product) {
@@ -1766,7 +1647,7 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
               id
               title
               handle
-              variants(first: 50) {
+              variants(first: 250) {
                 nodes {
                   id
                   sku
@@ -1794,7 +1675,6 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
         }
       );
 
-      const createJson = await createRes.json();
       const createdProduct = createJson?.data?.productCreate?.product;
       const userErrors = createJson?.data?.productCreate?.userErrors || [];
 
@@ -1807,13 +1687,14 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
       shopifyProductId = createdProduct.id;
       shopifyHandle = createdProduct.handle;
 
-      // --- CONSTRUCT & SYNC VARIANTS ---
-      if (specs.length === 1) {
+      // --- CONSTRUCT & SYNC VARIANTS (NEW PRODUCT) ---
+      if (normalizedSpecs.length === 1) {
         // Single variant: update the standalone variant created by productCreate
         const firstVariant = createdProduct.variants?.nodes?.[0];
         if (firstVariant?.id) {
           try {
-            await admin.graphql(
+            await executeShopifyGraphql(
+              admin,
               `#graphql
               mutation updateSingleVariant($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
                 productVariantsBulkUpdate(productId: $productId, variants: $variants) {
@@ -1840,7 +1721,7 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
                       price: primaryPrice,
                       inventoryPolicy: "DENY",
                       inventoryItem: {
-                        sku: specs[0].canonicalSku,
+                        sku: normalizedSpecs[0].canonicalSku,
                         tracked: true,
                       },
                       metafields: [
@@ -1848,7 +1729,7 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
                           namespace: "trends",
                           key: "stock_code",
                           type: "single_line_text_field",
-                          value: specs[0].stockCode,
+                          value: normalizedSpecs[0].stockCode,
                         },
                       ],
                     },
@@ -1860,14 +1741,14 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
             variantLedgerEntries.push({
               shopifyVariantId: firstVariant.id,
               inventoryItemId: firstVariant.inventoryItem?.id,
-              stockCode: specs[0].stockCode,
-              quantity: specs[0].quantity,
+              stockCode: normalizedSpecs[0].stockCode,
+              quantity: normalizedSpecs[0].quantity,
             });
 
             // Adjust inventory for single variant across configured locations
             if (primaryLocationId && firstVariant.inventoryItem?.id) {
               const allocations = allocateStockAcrossLocations(
-                specs[0].quantity,
+                normalizedSpecs[0].quantity,
                 effectiveMode,
                 effectiveTargetLocationId,
                 effectiveSplitLocationIds,
@@ -1877,7 +1758,7 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
                 inventoryItemId: firstVariant.inventoryItem.id,
                 quantity: alloc.quantity,
                 locationId: alloc.locationId,
-                sku: specs[0].canonicalSku,
+                sku: normalizedSpecs[0].canonicalSku,
               }));
               await syncInventoryQuantities(admin, primaryLocationId, itemsToSync);
             }
@@ -1886,144 +1767,146 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
             variantLedgerEntries.push({
               shopifyVariantId: firstVariant.id,
               inventoryItemId: firstVariant.inventoryItem?.id,
-              stockCode: specs[0].stockCode,
-              quantity: specs[0].quantity,
+              stockCode: normalizedSpecs[0].stockCode,
+              quantity: normalizedSpecs[0].quantity,
             });
           }
         }
       } else {
         // Multi-variant matrix: Replace standalone variant with complete matrix via productVariantsBulkCreate
-        try {
-          const bulkVariantsInput = specs.map((spec) => ({
-            price: primaryPrice,
-            inventoryPolicy: "DENY",
-            optionValues: [
-              {
-                optionName,
-                name: spec.optionValue,
-              },
-            ],
-            inventoryItem: {
-              sku: spec.canonicalSku,
-              tracked: true,
+        // Batched in chunks of up to 50 variants
+        const bulkVariantsInput = normalizedSpecs.map((spec) => ({
+          price: primaryPrice,
+          inventoryPolicy: "DENY",
+          optionValues: [
+            {
+              optionName,
+              name: spec.optionValue,
             },
-            metafields: [
-              {
-                namespace: "trends",
-                key: "stock_code",
-                type: "single_line_text_field",
-                value: spec.stockCode,
-              },
-            ],
-          }));
+          ],
+          inventoryItem: {
+            sku: spec.canonicalSku,
+            tracked: true,
+          },
+          metafields: [
+            {
+              namespace: "trends",
+              key: "stock_code",
+              type: "single_line_text_field",
+              value: spec.stockCode,
+            },
+          ],
+        }));
 
-          const bulkRes = await admin.graphql(
-            `#graphql
-            mutation bulkCreateVariants(
-              $productId: ID!
-              $variants: [ProductVariantsBulkInput!]!
-              $strategy: ProductVariantsBulkCreateStrategy
-            ) {
-              productVariantsBulkCreate(
-                productId: $productId
-                variants: $variants
-                strategy: $strategy
+        const allCreatedVariants: any[] = [];
+        const VARIANT_BATCH_SIZE = 50;
+
+        for (let i = 0; i < bulkVariantsInput.length; i += VARIANT_BATCH_SIZE) {
+          const chunk = bulkVariantsInput.slice(i, i + VARIANT_BATCH_SIZE);
+          const isFirstChunk = i === 0;
+
+          try {
+            const bulkJson = await executeShopifyGraphql(
+              admin,
+              `#graphql
+              mutation bulkCreateVariants(
+                $productId: ID!
+                $variants: [ProductVariantsBulkInput!]!
+                $strategy: ProductVariantsBulkCreateStrategy
               ) {
-                productVariants {
-                  id
-                  title
-                  price
-                  inventoryQuantity
-                  availableForSale
-                  inventoryPolicy
-                  inventoryItem {
+                productVariantsBulkCreate(
+                  productId: $productId
+                  variants: $variants
+                  strategy: $strategy
+                ) {
+                  productVariants {
                     id
-                    sku
-                    tracked
+                    title
+                    price
+                    inventoryQuantity
+                    availableForSale
+                    inventoryPolicy
+                    inventoryItem {
+                      id
+                      sku
+                      tracked
+                    }
+                  }
+                  userErrors {
+                    field
+                    message
                   }
                 }
-                userErrors {
-                  field
-                  message
-                }
+              }`,
+              {
+                variables: {
+                  productId: shopifyProductId,
+                  strategy: isFirstChunk ? "REMOVE_STANDALONE_VARIANT" : "DEFAULT",
+                  variants: chunk,
+                },
               }
-            }`,
-            {
-              variables: {
-                productId: shopifyProductId,
-                strategy: "REMOVE_STANDALONE_VARIANT",
-                variants: bulkVariantsInput,
-              },
-            }
-          );
-
-          const bulkJson = await bulkRes.json();
-          const createdVariants = bulkJson?.data?.productVariantsBulkCreate?.productVariants || [];
-          const bulkErrors = bulkJson?.data?.productVariantsBulkCreate?.userErrors || [];
-
-          if (bulkErrors.length > 0) {
-            console.warn(
-              "[Shopify Sync] productVariantsBulkCreate user errors:",
-              bulkErrors.map((e: { message: string }) => e.message).join(", ")
             );
-          }
 
-          // Map each spec to created variant GID
-          for (let i = 0; i < specs.length; i++) {
-            const spec = specs[i];
+            const createdChunkVariants = bulkJson?.data?.productVariantsBulkCreate?.productVariants || [];
+            allCreatedVariants.push(...createdChunkVariants);
+
+            const bulkErrors = bulkJson?.data?.productVariantsBulkCreate?.userErrors || [];
+            if (bulkErrors.length > 0) {
+              console.warn(
+                `[Shopify Sync] productVariantsBulkCreate user errors on batch ${Math.floor(i / VARIANT_BATCH_SIZE) + 1}:`,
+                bulkErrors.map((e: { message: string }) => e.message).join(", ")
+              );
+            }
+          } catch (bulkErr) {
+            console.warn(`[Shopify Sync] Bulk variant creation error on batch:`, bulkErr);
+          }
+        }
+
+        // Map each spec to created variant GID
+        for (let i = 0; i < normalizedSpecs.length; i++) {
+          const spec = normalizedSpecs[i];
+          const matched =
+            allCreatedVariants.find((cv: any) => cv.inventoryItem?.sku === spec.canonicalSku) ||
+            allCreatedVariants[i];
+
+          const varId = matched?.id || `${shopifyProductId}/variant/${spec.stockCode}`;
+          variantLedgerEntries.push({
+            shopifyVariantId: varId,
+            inventoryItemId: matched?.inventoryItem?.id,
+            stockCode: spec.stockCode,
+            quantity: spec.quantity,
+          });
+        }
+
+        // Multi-location inventory adjustment for bulk variants (ALL variants synced in 1 batched call)
+        if (primaryLocationId && allCreatedVariants.length > 0) {
+          const inventoryItemsToSync: InventorySyncItem[] = [];
+          for (let i = 0; i < normalizedSpecs.length; i++) {
+            const spec = normalizedSpecs[i];
             const matched =
-              createdVariants.find((cv: any) => cv.inventoryItem?.sku === spec.canonicalSku) ||
-              createdVariants[i];
-
-            const varId = matched?.id || `${shopifyProductId}/variant/${spec.stockCode}`;
-            variantLedgerEntries.push({
-              shopifyVariantId: varId,
-              inventoryItemId: matched?.inventoryItem?.id,
-              stockCode: spec.stockCode,
-              quantity: spec.quantity,
-            });
-          }
-
-          // Multi-location inventory adjustment for bulk variants
-          if (primaryLocationId && createdVariants.length > 0) {
-            const inventoryItemsToSync: InventorySyncItem[] = [];
-            for (let i = 0; i < specs.length; i++) {
-              const spec = specs[i];
-              const matched =
-                createdVariants.find((cv: any) => cv.inventoryItem?.sku === spec.canonicalSku) ||
-                createdVariants[i];
-              if (matched?.inventoryItem?.id) {
-                const allocations = allocateStockAcrossLocations(
-                  spec.quantity,
-                  effectiveMode,
-                  effectiveTargetLocationId,
-                  effectiveSplitLocationIds,
-                  primaryLocationId
-                );
-                for (const alloc of allocations) {
-                  inventoryItemsToSync.push({
-                    inventoryItemId: matched.inventoryItem.id,
-                    quantity: alloc.quantity,
-                    locationId: alloc.locationId,
-                    sku: spec.canonicalSku,
-                  });
-                }
+              allCreatedVariants.find((cv: any) => cv.inventoryItem?.sku === spec.canonicalSku) ||
+              allCreatedVariants[i];
+            if (matched?.inventoryItem?.id) {
+              const allocations = allocateStockAcrossLocations(
+                spec.quantity,
+                effectiveMode,
+                effectiveTargetLocationId,
+                effectiveSplitLocationIds,
+                primaryLocationId
+              );
+              for (const alloc of allocations) {
+                inventoryItemsToSync.push({
+                  inventoryItemId: matched.inventoryItem.id,
+                  quantity: alloc.quantity,
+                  locationId: alloc.locationId,
+                  sku: spec.canonicalSku,
+                });
               }
             }
-
-            if (inventoryItemsToSync.length > 0) {
-              await syncInventoryQuantities(admin, primaryLocationId, inventoryItemsToSync);
-            }
           }
-        } catch (bulkErr) {
-          console.warn("[Shopify Sync] Bulk variant creation error:", bulkErr);
-          // Fallback to tracking specs
-          for (const spec of specs) {
-            variantLedgerEntries.push({
-              shopifyVariantId: `${shopifyProductId}/variant/${spec.stockCode}`,
-              stockCode: spec.stockCode,
-              quantity: spec.quantity,
-            });
+
+          if (inventoryItemsToSync.length > 0) {
+            await syncInventoryQuantities(admin, primaryLocationId, inventoryItemsToSync);
           }
         }
       }
@@ -2050,7 +1933,8 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
         updateInput.descriptionHtml = buildDescriptionHtml(trendsProduct);
       }
 
-      const updateRes = await admin.graphql(
+      const updateJson = await executeShopifyGraphql(
+        admin,
         `#graphql
         mutation productUpdate($product: ProductUpdateInput!) {
           productUpdate(product: $product) {
@@ -2072,20 +1956,20 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
         }
       );
 
-      const updateJson = await updateRes.json();
       const updatedProduct = updateJson?.data?.productUpdate?.product;
       if (updatedProduct?.handle) {
         shopifyHandle = updatedProduct.handle;
       }
 
-      // Synchronize existing variant prices if not locked
+      // Synchronize existing variant prices if not locked, AND create any missing variants!
       try {
-        const varQueryRes = await admin.graphql(
+        const varQueryJson = await executeShopifyGraphql(
+          admin,
           `#graphql
           query getProductVariants($id: ID!) {
             product(id: $id) {
               totalInventory
-              variants(first: 50) {
+              variants(first: 250) {
                 nodes {
                   id
                   sku
@@ -2105,14 +1989,17 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
             variables: { id: shopifyProductId },
           }
         );
-        const varQueryJson = await varQueryRes.json();
+
         const existingNodes = varQueryJson?.data?.product?.variants?.nodes || [];
 
-        const updatePayload = [];
-        for (const spec of specs) {
+        const updatePayload: any[] = [];
+        const missingSpecsToCreate: VariantSpec[] = [];
+
+        for (const spec of normalizedSpecs) {
           const matchedNode = existingNodes.find(
             (n: any) => n.inventoryItem?.sku === spec.canonicalSku || n.sku === spec.canonicalSku
           );
+
           if (matchedNode?.id) {
             variantLedgerEntries.push({
               shopifyVariantId: matchedNode.id,
@@ -2120,6 +2007,7 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
               stockCode: spec.stockCode,
               quantity: spec.quantity,
             });
+
             const varUpdate: Record<string, unknown> = {
               id: matchedNode.id,
               inventoryPolicy: "DENY",
@@ -2133,16 +2021,17 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
             }
             updatePayload.push(varUpdate);
           } else {
-            variantLedgerEntries.push({
-              shopifyVariantId: `${shopifyProductId}/variant/${spec.stockCode}`,
-              stockCode: spec.stockCode,
-              quantity: spec.quantity,
-            });
+            // Missing variant! Mark for creation
+            missingSpecsToCreate.push(spec);
           }
         }
 
-        if (updatePayload.length > 0) {
-          await admin.graphql(
+        // 1. Bulk update existing variants in chunks of 50
+        const VARIANT_BATCH_SIZE = 50;
+        for (let i = 0; i < updatePayload.length; i += VARIANT_BATCH_SIZE) {
+          const chunk = updatePayload.slice(i, i + VARIANT_BATCH_SIZE);
+          await executeShopifyGraphql(
+            admin,
             `#graphql
             mutation updateExistingVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
               productVariantsBulkUpdate(productId: $productId, variants: $variants) {
@@ -2159,22 +2048,104 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
             {
               variables: {
                 productId: shopifyProductId,
-                variants: updatePayload,
+                variants: chunk,
               },
             }
           );
         }
 
-        // Synchronize inventory quantities for existing variants across configured locations
+        // 2. Bulk create missing variants in chunks of 50 via productVariantsBulkCreate
+        if (missingSpecsToCreate.length > 0) {
+          console.info(
+            `[Shopify Sync] Creating ${missingSpecsToCreate.length} missing variant(s) on existing product ${trendsCode}`
+          );
+
+          for (let i = 0; i < missingSpecsToCreate.length; i += VARIANT_BATCH_SIZE) {
+            const chunk = missingSpecsToCreate.slice(i, i + VARIANT_BATCH_SIZE);
+            const chunkInput = chunk.map((spec) => ({
+              price: primaryPrice,
+              inventoryPolicy: "DENY",
+              optionValues: [
+                {
+                  optionName,
+                  name: spec.optionValue,
+                },
+              ],
+              inventoryItem: {
+                sku: spec.canonicalSku,
+                tracked: true,
+              },
+              metafields: [
+                {
+                  namespace: "trends",
+                  key: "stock_code",
+                  type: "single_line_text_field",
+                  value: spec.stockCode,
+                },
+              ],
+            }));
+
+            try {
+              const createRes = await executeShopifyGraphql(
+                admin,
+                `#graphql
+                mutation createMissingVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+                  productVariantsBulkCreate(productId: $productId, variants: $variants) {
+                    productVariants {
+                      id
+                      title
+                      inventoryItem {
+                        id
+                        sku
+                      }
+                    }
+                    userErrors {
+                      field
+                      message
+                    }
+                  }
+                }`,
+                {
+                  variables: {
+                    productId: shopifyProductId,
+                    variants: chunkInput,
+                  },
+                }
+              );
+
+              const createdNodes = createRes?.data?.productVariantsBulkCreate?.productVariants || [];
+              for (const spec of chunk) {
+                const matched = createdNodes.find((cv: any) => cv.inventoryItem?.sku === spec.canonicalSku);
+                variantLedgerEntries.push({
+                  shopifyVariantId: matched?.id || `${shopifyProductId}/variant/${spec.stockCode}`,
+                  inventoryItemId: matched?.inventoryItem?.id,
+                  stockCode: spec.stockCode,
+                  quantity: spec.quantity,
+                });
+              }
+            } catch (createErr) {
+              console.warn(`[Shopify Sync] Could not bulk create missing variants chunk:`, createErr);
+              for (const spec of chunk) {
+                variantLedgerEntries.push({
+                  shopifyVariantId: `${shopifyProductId}/variant/${spec.stockCode}`,
+                  stockCode: spec.stockCode,
+                  quantity: spec.quantity,
+                });
+              }
+            }
+          }
+        }
+
+        // 3. Synchronize inventory quantities for ALL variants across configured locations in 1 batched call
         if (primaryLocationId && !syncLocks.includes("inventory")) {
           const inventoryItemsToUpdate: InventorySyncItem[] = [];
-          for (const spec of specs) {
-            const matchedNode = existingNodes.find(
-              (n: any) => n.inventoryItem?.sku === spec.canonicalSku || n.sku === spec.canonicalSku
-            );
-            if (matchedNode?.inventoryItem?.id) {
+
+          for (const vEntry of variantLedgerEntries) {
+            if (vEntry.inventoryItemId) {
+              const spec = normalizedSpecs.find((s) => s.stockCode === vEntry.stockCode);
+              const qty = spec?.quantity ?? vEntry.quantity ?? 0;
               const allocations = allocateStockAcrossLocations(
-                spec.quantity,
+                qty,
                 effectiveMode,
                 effectiveTargetLocationId,
                 effectiveSplitLocationIds,
@@ -2182,10 +2153,10 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
               );
               for (const alloc of allocations) {
                 inventoryItemsToUpdate.push({
-                  inventoryItemId: matchedNode.inventoryItem.id,
+                  inventoryItemId: vEntry.inventoryItemId,
                   quantity: alloc.quantity,
                   locationId: alloc.locationId,
-                  sku: spec.canonicalSku,
+                  sku: spec?.canonicalSku || vEntry.stockCode,
                 });
               }
             }
@@ -2207,7 +2178,7 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
       trendsProduct.images.length > 0
     ) {
       try {
-        const variantImageExtraction = extractVariantImageMappings(trendsProduct, specs);
+        const variantImageExtraction = extractVariantImageMappings(trendsProduct, normalizedSpecs);
         const mediaResult = await syncProductMedia(
           admin,
           shopifyProductId,
@@ -2218,7 +2189,7 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
           admin,
           shopifyProductId,
           variantLedgerEntries,
-          specs,
+          normalizedSpecs,
           variantImageExtraction.mappings,
           mediaResult,
           trendsProduct.name
@@ -2237,7 +2208,7 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
 
   // Ensure fallback variant ledger entries if offline or mock
   if (variantLedgerEntries.length === 0) {
-    for (const spec of specs) {
+    for (const spec of normalizedSpecs) {
       variantLedgerEntries.push({
         shopifyVariantId: `${resolvedShopifyProductId}/variant/${spec.stockCode}`,
         stockCode: spec.stockCode,
