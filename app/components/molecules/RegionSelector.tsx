@@ -1,7 +1,7 @@
 import React, { useEffect } from "react";
+import { useSearchParams } from "react-router";
 import type { Region } from "../../../shared/types/trends.types";
 import { useRegionStore } from "../../stores/useRegionStore";
-import { useCatalogStore } from "../../stores/useCatalogStore";
 
 const REGION_METADATA: Record<Region, { flag: string; label: string; currency: string }> = {
   nz: { flag: "🇳🇿", label: "New Zealand", currency: "NZD" },
@@ -21,11 +21,10 @@ export interface RegionSelectorProps {
 }
 
 export const RegionSelector: React.FC<RegionSelectorProps> = ({ enabledRegions }) => {
+  const [searchParams, setSearchParams] = useSearchParams();
   const currentRegion = useRegionStore((s) => s.currentRegion);
   const setRegion = useRegionStore((s) => s.setRegion);
   const setEnabledRegions = useRegionStore((s) => s.setEnabledRegions);
-  const fetchCategories = useCatalogStore((s) => s.fetchCategories);
-  const fetchProducts = useCatalogStore((s) => s.fetchProducts);
 
   // Sync server-side enabled list into the store on mount / when it changes.
   useEffect(() => {
@@ -35,9 +34,10 @@ export const RegionSelector: React.FC<RegionSelectorProps> = ({ enabledRegions }
   const handleRegionChange = (newRegion: Region) => {
     if (newRegion !== currentRegion) {
       setRegion(newRegion);
-      // Automatically refresh catalog for the newly active region
-      fetchCategories();
-      fetchProducts({ pageNo: 1 });
+      // Synchronize URL query parameter with active selection
+      const nextParams = new URLSearchParams(searchParams);
+      nextParams.set("region", newRegion);
+      setSearchParams(nextParams, { replace: true });
     }
   };
 

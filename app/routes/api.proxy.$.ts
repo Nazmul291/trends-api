@@ -16,14 +16,18 @@ import { getAppSettings } from "../../server/settings/app-settings.service";
  * Helper to parse region and endpoint path from request
  * Accepts /api/proxy/:region/:endpoint or query ?region=:region
  */
-function parseProxyTarget(params: Record<string, string | undefined>, url: URL): {
-  region: Region;
+function parseProxyTarget(
+  params: Record<string, string | undefined>,
+  url: URL,
+  defaultRegion?: Region
+): {
+  region: Region | null;
   endpoint: string;
 } {
   const wildcard = params["*"] || "";
   const segments = wildcard.split("/").filter(Boolean);
 
-  let region: Region = "nz";
+  let region: Region | null = null;
   let endpointSegments = segments;
 
   if (segments.length > 0 && ["nz", "au", "sg"].includes(segments[0].toLowerCase())) {
@@ -34,6 +38,10 @@ function parseProxyTarget(params: Record<string, string | undefined>, url: URL):
     if (queryRegion && ["nz", "au", "sg"].includes(queryRegion.toLowerCase())) {
       region = queryRegion.toLowerCase() as Region;
     }
+  }
+
+  if (!region && defaultRegion) {
+    region = defaultRegion;
   }
 
   const endpoint = endpointSegments.join("/");
@@ -76,9 +84,19 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
 
   // Load DB-backed settings (falls back to env vars if no record exists)
   const appSettings = await getAppSettings(shop);
+  const enabledRegions = (appSettings.enabledRegions || []) as Region[];
+  const fallbackRegion: Region = enabledRegions[0] || "au";
 
   const url = new URL(request.url);
-  const { region, endpoint } = parseProxyTarget(params, url);
+  const target = parseProxyTarget(params, url, fallbackRegion);
+  const endpoint = target.endpoint;
+  let region: Region = target.region || fallbackRegion;
+
+  // Strictly enforce enabled regions from database settings:
+  // If requested region is missing, invalid, or disabled, reassign dynamically to first enabled region.
+  if (enabledRegions.length > 0 && !enabledRegions.includes(region)) {
+    region = enabledRegions[0];
+  }
 
   if (!endpoint) {
     return Response.json(
@@ -242,9 +260,19 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 
   // Load DB-backed settings (falls back to env vars if no record exists)
   const appSettings = await getAppSettings(shop);
+  const enabledRegions = (appSettings.enabledRegions || []) as Region[];
+  const fallbackRegion: Region = enabledRegions[0] || "au";
 
   const url = new URL(request.url);
-  const { region, endpoint } = parseProxyTarget(params, url);
+  const target = parseProxyTarget(params, url, fallbackRegion);
+  const endpoint = target.endpoint;
+  let region: Region = target.region || fallbackRegion;
+
+  // Strictly enforce enabled regions from database settings:
+  // If requested region is missing, invalid, or disabled, reassign dynamically to first enabled region.
+  if (enabledRegions.length > 0 && !enabledRegions.includes(region)) {
+    region = enabledRegions[0];
+  }
 
   if (!endpoint) {
     return Response.json(
