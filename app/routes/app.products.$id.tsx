@@ -11,7 +11,60 @@ import { Skeleton } from "../components/atoms/Skeleton";
 import { StockBadge } from "../components/molecules/StockBadge";
 import { LeadTimeIndicator } from "../components/molecules/LeadTimeIndicator";
 import { formatCurrency } from "../../shared/utils/formatters";
+import type { ProductData, StockItemData } from "../../shared/types/trends.types";
 import { normalizePricing } from "../../shared/types/trends.types";
+
+/**
+ * Resolves the unit price for a variant/stock line item.
+ * Checks variant-level fields first, then matched product variants,
+ * then falls back to the product's primary starting tier price.
+ */
+function getVariantPrice(
+  item: StockItemData,
+  product?: ProductData | null
+): number | string | null {
+  const rawItem = item as unknown as Record<string, unknown>;
+
+  // 1. Check direct variant price fields
+  if (rawItem.price !== undefined && rawItem.price !== null && rawItem.price !== "") {
+    return rawItem.price as number | string;
+  }
+  if (rawItem.unit_price !== undefined && rawItem.unit_price !== null && rawItem.unit_price !== "") {
+    return rawItem.unit_price as number | string;
+  }
+  if (rawItem.unitPrice !== undefined && rawItem.unitPrice !== null && rawItem.unitPrice !== "") {
+    return rawItem.unitPrice as number | string;
+  }
+  if (rawItem.wholesale_price !== undefined && rawItem.wholesale_price !== null && rawItem.wholesale_price !== "") {
+    return rawItem.wholesale_price as number | string;
+  }
+
+  // 2. Check matched product variants by stock code / SKU if present
+  const prodAny = product as Record<string, unknown> | null | undefined;
+  if (Array.isArray(prodAny?.variants)) {
+    const matched = prodAny.variants.find(
+      (v: any) =>
+        v.sku === item.stock_code ||
+        v.stock_code === item.stock_code ||
+        v.code === item.stock_code ||
+        String(v.id) === String(item.stock_code)
+    );
+    if (matched?.price !== undefined && matched?.price !== null && matched?.price !== "") {
+      return matched.price;
+    }
+  }
+
+  // 3. Fallback to product primary pricing tier starting price
+  const pricingList = normalizePricing(product?.pricing);
+  if (pricingList.length > 0 && pricingList[0].prices && pricingList[0].prices.length > 0) {
+    const startingPrice = pricingList[0].prices[0].price;
+    if (startingPrice !== undefined && startingPrice !== null && startingPrice !== "") {
+      return startingPrice;
+    }
+  }
+
+  return null;
+}
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   await authenticate.admin(request);
@@ -590,27 +643,38 @@ export default function ProductDetailPage() {
                   <th style={{ padding: "10px 14px", fontSize: "12px", color: "#6d7175" }}>Stock Code</th>
                   <th style={{ padding: "10px 14px", fontSize: "12px", color: "#6d7175" }}>Variant Description</th>
                   <th style={{ padding: "10px 14px", fontSize: "12px", color: "#6d7175" }}>Available Stock</th>
+                  <th style={{ padding: "10px 14px", fontSize: "12px", color: "#6d7175" }}>Price</th>
                   <th style={{ padding: "10px 14px", fontSize: "12px", color: "#6d7175" }}>Status</th>
                 </tr>
               </thead>
               <tbody>
-                {stock.map((item, idx) => (
-                  <tr key={idx} style={{ borderBottom: "1px solid #f1f2f3" }}>
-                    <td style={{ padding: "10px 14px", fontSize: "13px", fontWeight: 600 }}>{item.stock_code}</td>
-                    <td style={{ padding: "10px 14px", fontSize: "13px", color: "#5c5f62" }}>{item.description}</td>
-                    <td style={{ padding: "10px 14px", fontSize: "13px", fontWeight: 700 }}>
-                      {(Number(item.quantity) || 0).toLocaleString()}
-                    </td>
-                    <td style={{ padding: "10px 14px" }}>
-                      <StockBadge
-                        quantity={typeof item.quantity === "number" ? item.quantity : Number(item.quantity) || 0}
-                        nextShipment={item.next_shipment}
-                        dueDate={item.due_date}
-                        size="sm"
-                      />
-                    </td>
-                  </tr>
-                ))}
+                {stock.map((item, idx) => {
+                  const variantPrice = getVariantPrice(item, product);
+                  return (
+                    <tr key={idx} style={{ borderBottom: "1px solid #f1f2f3" }}>
+                      <td style={{ padding: "10px 14px", fontSize: "13px", fontWeight: 600 }}>{item.stock_code}</td>
+                      <td style={{ padding: "10px 14px", fontSize: "13px", color: "#5c5f62" }}>{item.description}</td>
+                      <td style={{ padding: "10px 14px", fontSize: "13px", fontWeight: 700 }}>
+                        {(Number(item.quantity) || 0).toLocaleString()}
+                      </td>
+                      <td style={{ padding: "10px 14px", fontSize: "13px", fontWeight: 600, color: "#202223" }}>
+                        {variantPrice !== null && variantPrice !== undefined ? (
+                          formatCurrency(variantPrice, currentRegion)
+                        ) : (
+                          <span style={{ color: "#8c9196" }}>-</span>
+                        )}
+                      </td>
+                      <td style={{ padding: "10px 14px" }}>
+                        <StockBadge
+                          quantity={typeof item.quantity === "number" ? item.quantity : Number(item.quantity) || 0}
+                          nextShipment={item.next_shipment && item.next_shipment > 0 ? item.next_shipment : undefined}
+                          dueDate={item.due_date && item.due_date !== "-" ? item.due_date : null}
+                          size="sm"
+                        />
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

@@ -21,14 +21,18 @@ export const StockBadge: React.FC<StockBadgeProps> = ({
 }) => {
   const status = evaluateStockStatus(quantity, { isUntracked, pricingType });
 
+  const hasIncomingShipment = Boolean(
+    nextShipment && nextShipment > 0 && dueDate && dueDate !== "-"
+  );
+
   return (
     <div style={{ display: "inline-flex", flexDirection: "column", gap: "2px" }}>
       <StatusBadge label={status.label} tone={status.tone} size={size} dot />
-      {nextShipment && nextShipment > 0 && dueDate && (
+      {hasIncomingShipment ? (
         <span style={{ fontSize: "10px", color: "#6d7175", marginLeft: "4px" }}>
           +{nextShipment} arriving {formatDate(dueDate)}
         </span>
-      )}
+      ) : null}
     </div>
   );
 };

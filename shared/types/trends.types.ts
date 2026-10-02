@@ -224,6 +224,8 @@ export interface StockItemData {
   quantity: number;
   next_shipment?: number;
   due_date?: string | null;
+  price?: number | string | null;
+  unit_price?: number | string | null;
 }
 
 export interface StockListData {
