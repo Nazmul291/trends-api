@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { useActionData, useLoaderData, useNavigation, Form } from "react-router";
 import { authenticate } from "../shopify.server";
@@ -177,7 +177,8 @@ export default function SettingsPage() {
   const navigation = useNavigation();
   const isSubmitting = navigation.state === "submitting";
 
-  // Credentials & regions state
+  // Controlled form state
+  const [apiKey, setApiKey] = useState(trendsApiKey ?? "");
   const [showKey, setShowKey] = useState(false);
   const [mockFallback, setMockFallback] = useState(enableTrendsMockFallback);
   const [activeRegions, setActiveRegions] = useState<Region[]>(enabledRegions as Region[]);
@@ -190,10 +191,109 @@ export default function SettingsPage() {
   const [scopeInventory, setScopeInventory] = useState(initialSyncScope.includes("inventory"));
   const [scopePrice, setScopePrice] = useState(initialSyncScope.includes("price"));
 
+  // Persisted state baseline for tracking unsaved modifications
+  const [persistedState, setPersistedState] = useState(() => ({
+    apiKey: trendsApiKey ?? "",
+    mockFallback: enableTrendsMockFallback,
+    activeRegions: [...(enabledRegions as Region[])].sort(),
+    autoSync: initialAutoSync,
+    frequency: initialFrequency || "daily",
+    syncTime: initialSyncTime || "02:00",
+    batchSize: initialBatchSize || 50,
+    scopeInventory: initialSyncScope.includes("inventory"),
+    scopePrice: initialSyncScope.includes("price"),
+  }));
+
+  // Re-synchronize baseline whenever fresh loader data is loaded
+  useEffect(() => {
+    setPersistedState({
+      apiKey: trendsApiKey ?? "",
+      mockFallback: enableTrendsMockFallback,
+      activeRegions: [...(enabledRegions as Region[])].sort(),
+      autoSync: initialAutoSync,
+      frequency: initialFrequency || "daily",
+      syncTime: initialSyncTime || "02:00",
+      batchSize: initialBatchSize || 50,
+      scopeInventory: initialSyncScope.includes("inventory"),
+      scopePrice: initialSyncScope.includes("price"),
+    });
+  }, [
+    trendsApiKey,
+    enableTrendsMockFallback,
+    enabledRegions,
+    initialAutoSync,
+    initialFrequency,
+    initialSyncTime,
+    initialBatchSize,
+    initialSyncScope,
+  ]);
+
   const hasSaved = actionData?.success === true && actionData?.actionType === "saveSettings";
   const hasSaveError = actionData?.success === false && actionData?.actionType === "saveSettings";
   const hasSyncNowSuccess = actionData?.success === true && actionData?.actionType === "syncNow";
   const hasSyncNowError = actionData?.success === false && actionData?.actionType === "syncNow";
+
+  // Re-synchronize baseline immediately upon successful save action
+  useEffect(() => {
+    if (hasSaved) {
+      setPersistedState({
+        apiKey,
+        mockFallback,
+        activeRegions: [...activeRegions].sort(),
+        autoSync,
+        frequency,
+        syncTime,
+        batchSize,
+        scopeInventory,
+        scopePrice,
+      });
+    }
+  }, [hasSaved]);
+
+  // Robust deep dirty-state checking across all form fields
+  const isDirty = useMemo(() => {
+    if (apiKey !== persistedState.apiKey) return true;
+    if (mockFallback !== persistedState.mockFallback) return true;
+    if (autoSync !== persistedState.autoSync) return true;
+    if (frequency !== persistedState.frequency) return true;
+    if (syncTime !== persistedState.syncTime) return true;
+    if (batchSize !== persistedState.batchSize) return true;
+    if (scopeInventory !== persistedState.scopeInventory) return true;
+    if (scopePrice !== persistedState.scopePrice) return true;
+
+    // Compare active regions list
+    const currentSorted = [...activeRegions].sort();
+    if (currentSorted.length !== persistedState.activeRegions.length) return true;
+    for (let i = 0; i < currentSorted.length; i++) {
+      if (currentSorted[i] !== persistedState.activeRegions[i]) return true;
+    }
+
+    return false;
+  }, [
+    apiKey,
+    mockFallback,
+    activeRegions,
+    autoSync,
+    frequency,
+    syncTime,
+    batchSize,
+    scopeInventory,
+    scopePrice,
+    persistedState,
+  ]);
+
+  // Discard changes & restore initial persisted state
+  const handleDiscard = () => {
+    setApiKey(persistedState.apiKey);
+    setMockFallback(persistedState.mockFallback);
+    setActiveRegions([...persistedState.activeRegions]);
+    setAutoSync(persistedState.autoSync);
+    setFrequency(persistedState.frequency);
+    setSyncTime(persistedState.syncTime);
+    setBatchSize(persistedState.batchSize);
+    setScopeInventory(persistedState.scopeInventory);
+    setScopePrice(persistedState.scopePrice);
+  };
 
   const toggleRegion = (region: Region) => {
     setActiveRegions((prev) => {
@@ -205,6 +305,7 @@ export default function SettingsPage() {
 
   // Preview generated cron expression
   const previewCron = buildCronExpression(frequency, syncTime);
+  const isSaveDisabled = !isDirty || isSubmitting;
 
   // Format last synced timestamp
   const formattedLastSync = lastSyncedAt
@@ -860,7 +961,8 @@ export default function SettingsPage() {
                   id="trendsApiKey"
                   name="trendsApiKey"
                   type={showKey ? "text" : "password"}
-                  defaultValue={trendsApiKey ?? ""}
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
                   placeholder="Enter your Trends API Bearer token…"
                   autoComplete="new-password"
                   style={{
@@ -1103,11 +1205,77 @@ export default function SettingsPage() {
             </div>
           </section>
 
-          {/* Save Button */}
-          <div style={{ display: "flex", justifyContent: "flex-end" }}>
+          {/* Save & Discard Actions */}
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "flex-end",
+              alignItems: "center",
+              gap: "12px",
+              marginTop: "8px",
+            }}
+          >
+            {/* Unsaved changes badge indicator */}
+            {isDirty && (
+              <span
+                style={{
+                  fontSize: "12px",
+                  color: "#b45309",
+                  backgroundColor: "#fef3c7",
+                  border: "1px solid #fde68a",
+                  padding: "4px 10px",
+                  borderRadius: "12px",
+                  fontWeight: 600,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "6px",
+                }}
+              >
+                <span
+                  style={{
+                    width: "6px",
+                    height: "6px",
+                    borderRadius: "50%",
+                    backgroundColor: "#f59e0b",
+                    display: "inline-block",
+                  }}
+                />
+                Unsaved changes
+              </span>
+            )}
+
+            {/* Discard Changes Button */}
+            {isDirty && (
+              <button
+                type="button"
+                onClick={handleDiscard}
+                disabled={isSubmitting}
+                style={{
+                  padding: "10px 18px",
+                  fontSize: "13px",
+                  fontWeight: 600,
+                  color: "#5c5f62",
+                  backgroundColor: "#ffffff",
+                  border: "1px solid #c9cccf",
+                  borderRadius: "8px",
+                  cursor: isSubmitting ? "not-allowed" : "pointer",
+                  transition: "all 0.15s ease",
+                }}
+                onMouseEnter={(e) => {
+                  if (!isSubmitting) e.currentTarget.style.backgroundColor = "#f6f6f7";
+                }}
+                onMouseLeave={(e) => {
+                  if (!isSubmitting) e.currentTarget.style.backgroundColor = "#ffffff";
+                }}
+              >
+                Discard Changes
+              </button>
+            )}
+
+            {/* Save Button (Disabled by default until dirty or during submission) */}
             <button
               type="submit"
-              disabled={isSubmitting}
+              disabled={isSaveDisabled}
               style={{
                 display: "inline-flex",
                 alignItems: "center",
@@ -1116,12 +1284,19 @@ export default function SettingsPage() {
                 fontSize: "14px",
                 fontWeight: 600,
                 color: "#ffffff",
-                backgroundColor: isSubmitting ? "#5c9e88" : "#008060",
+                backgroundColor: isSaveDisabled ? "#8c9196" : "#008060",
                 border: "none",
                 borderRadius: "8px",
-                cursor: isSubmitting ? "not-allowed" : "pointer",
-                transition: "background-color 0.15s ease",
-                boxShadow: "0 1px 2px rgba(0,0,0,0.08)",
+                cursor: isSaveDisabled ? "not-allowed" : "pointer",
+                opacity: isSaveDisabled ? (isSubmitting ? 0.85 : 0.5) : 1,
+                transition: "all 0.15s ease",
+                boxShadow: isSaveDisabled ? "none" : "0 1px 2px rgba(0,0,0,0.08)",
+              }}
+              onMouseEnter={(e) => {
+                if (!isSaveDisabled) e.currentTarget.style.backgroundColor = "#006e52";
+              }}
+              onMouseLeave={(e) => {
+                if (!isSaveDisabled) e.currentTarget.style.backgroundColor = "#008060";
               }}
             >
               {isSubmitting ? (
