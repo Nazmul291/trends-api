@@ -61,7 +61,7 @@ interface CatalogState {
 const DEFAULT_PAGINATION: PaginationMeta = {
   pageCurrent: 1,
   pageCount: 1,
-  pageSize: 24,
+  pageSize: 50,
   totalItems: 0,
 };
 
@@ -160,6 +160,7 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
     try {
       const queryParams = new URLSearchParams({
         page_no: String(pageNo),
+        page_size: "50",
       });
 
       if (categoryNo !== null && categoryNo !== undefined && categoryNo !== "") {
@@ -194,13 +195,18 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
         );
       }
 
+      const pageSize = listData?.page_size || 50;
+      const totalItems = listData?.total_items || items.length;
+      const pageCount = listData?.page_count || Math.max(1, Math.ceil(totalItems / pageSize));
+      const pageCurrent = listData?.page_current || pageNo;
+
       set({
         products: items,
         pagination: {
-          pageCurrent: listData?.page_current || 1,
-          pageCount: listData?.page_count || 1,
-          pageSize: listData?.page_size || 24,
-          totalItems: listData?.total_items || items.length,
+          pageCurrent,
+          pageCount,
+          pageSize,
+          totalItems,
         },
         productsStatus: "success",
         productsError: null,

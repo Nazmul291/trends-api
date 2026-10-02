@@ -108,7 +108,12 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
       }
 
       const envelope = (await res.json()) as ApiProxyResponse<ProductShowData>;
-      const product = envelope.data?.data || null;
+      const rawData = envelope.data?.data;
+      const product = Array.isArray(rawData) ? rawData[0] || null : rawData || null;
+
+      if (product?.stock && Array.isArray(product.stock) && product.stock.length > 0) {
+        set({ stock: product.stock, stockStatus: "success", stockError: null });
+      }
 
       set({
         product,
@@ -150,13 +155,15 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
       }
 
       const envelope = (await res.json()) as ApiProxyResponse<StockListData>;
-      const stock = envelope.data?.data || [];
+      const rawStock = envelope.data?.data;
+      const stock = Array.isArray(rawStock) ? rawStock : [];
 
-      set({
+      set((state) => ({
         stock,
         stockStatus: "success",
         stockError: null,
-      });
+        product: state.product ? { ...state.product, stock } : state.product,
+      }));
     } catch (err: unknown) {
       if ((err as Error)?.name === "AbortError") return;
       set({

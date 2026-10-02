@@ -124,7 +124,12 @@ export default function ProductDetailPage() {
   const images = product.images || [];
   const activeImage = images[activeImageIndex]?.link || "https://placehold.co/500x500?text=No+Image";
   const primaryPricing = product.pricing?.[0];
-  const totalStock = stock.reduce((sum, item) => sum + (item.quantity || 0), 0);
+  const stockList = Array.isArray(stock) && stock.length > 0 ? stock : Array.isArray(product.stock) ? product.stock : [];
+  const hasStockData = stockList.length > 0;
+  const totalStock = hasStockData
+    ? stockList.reduce((sum, item) => sum + (typeof item.quantity === "number" ? item.quantity : Number(item.quantity) || 0), 0)
+    : 0;
+  const isIndent = Boolean(product.pricing?.some((p) => p.type?.toLowerCase() === "indent"));
 
   // Normalize colours: live API may return a string or string[] — always coerce to string[]
   const productColours: string[] = Array.isArray(product.colours)
@@ -592,11 +597,11 @@ export default function ProductDetailPage() {
                     <td style={{ padding: "10px 14px", fontSize: "13px", fontWeight: 600 }}>{item.stock_code}</td>
                     <td style={{ padding: "10px 14px", fontSize: "13px", color: "#5c5f62" }}>{item.description}</td>
                     <td style={{ padding: "10px 14px", fontSize: "13px", fontWeight: 700 }}>
-                      {item.quantity.toLocaleString()}
+                      {(Number(item.quantity) || 0).toLocaleString()}
                     </td>
                     <td style={{ padding: "10px 14px" }}>
                       <StockBadge
-                        quantity={item.quantity}
+                        quantity={typeof item.quantity === "number" ? item.quantity : Number(item.quantity) || 0}
                         nextShipment={item.next_shipment}
                         dueDate={item.due_date}
                         size="sm"

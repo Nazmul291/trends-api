@@ -3,10 +3,12 @@ import { StatusBadge } from "../atoms/StatusBadge";
 import { evaluateStockStatus, formatDate } from "../../../shared/utils/formatters";
 
 export interface StockBadgeProps {
-  quantity: number;
+  quantity?: number | null;
   nextShipment?: number;
   dueDate?: string | null;
   size?: "sm" | "md";
+  isUntracked?: boolean;
+  pricingType?: string;
 }
 
 export const StockBadge: React.FC<StockBadgeProps> = ({
@@ -14,8 +16,10 @@ export const StockBadge: React.FC<StockBadgeProps> = ({
   nextShipment,
   dueDate,
   size = "md",
+  isUntracked,
+  pricingType,
 }) => {
-  const status = evaluateStockStatus(quantity);
+  const status = evaluateStockStatus(quantity, { isUntracked, pricingType });
 
   return (
     <div style={{ display: "inline-flex", flexDirection: "column", gap: "2px" }}>

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import type { ProductData, Region } from "../../shared/types/trends.types";
+import type { ProductData, Region, StockListData } from "../../shared/types/trends.types";
+import { TrendsApiClient } from "../api-client/trends-client";
 import prisma from "../../app/db.server";
 
 export interface SyncTrendProductOptions {
@@ -142,19 +143,28 @@ export function buildVariantSpecs(
   trendsCode: string
 ): { optionName: string; specs: VariantSpec[] } {
   const normalizedRegion = region.toLowerCase() as Region;
-  const hasColours = Boolean(product.colours && product.colours.length > 0);
+  const rawColours = product.colours as unknown;
+  const colours: string[] = Array.isArray(rawColours)
+    ? rawColours
+    : typeof rawColours === "string" && rawColours.length > 0
+    ? (rawColours as string).split(",").map((c: string) => c.trim()).filter(Boolean)
+    : [];
+  const hasColours = colours.length > 0;
   const optionName = hasColours ? "Color" : "Style";
 
   let rawList: { stockCode: string; description: string; quantity: number }[] = [];
 
   if (product.stock && product.stock.length > 0) {
-    rawList = product.stock.map((s, idx) => ({
-      stockCode: String(s.stock_code || `STK-${idx + 1}`),
-      description: s.description || product.colours?.[idx] || `Style ${idx + 1}`,
-      quantity: typeof s.quantity === "number" ? s.quantity : 0,
-    }));
+    rawList = product.stock.map((s, idx) => {
+      const q = typeof s.quantity === "number" ? s.quantity : Number(s.quantity);
+      return {
+        stockCode: String(s.stock_code || `STK-${idx + 1}`),
+        description: s.description || colours[idx] || `Style ${idx + 1}`,
+        quantity: !isNaN(q) ? Math.max(0, q) : 0,
+      };
+    });
   } else if (hasColours) {
-    rawList = (product.colours || []).map((col, idx) => ({
+    rawList = colours.map((col, idx) => ({
       stockCode: `COL-${idx + 1}`,
       description: col,
       quantity: 100,
@@ -453,13 +463,29 @@ export async function syncTrendProductToShopify({
   let shopifyProductId = existingSync?.shopifyProductId;
   let shopifyHandle: string | undefined;
 
-  // 2. Extract base price & variant specifications
+  // 2. Ensure product has live stock data for accurate variant inventory
+  if ((!trendsProduct.stock || trendsProduct.stock.length === 0) && trendsCode) {
+    try {
+      const stockRes = await TrendsApiClient.request<StockListData>(normalizedRegion, `stock/${trendsCode}`);
+      const stockItems = stockRes?.data?.data;
+      if (Array.isArray(stockItems) && stockItems.length > 0) {
+        trendsProduct = {
+          ...trendsProduct,
+          stock: stockItems,
+        };
+      }
+    } catch (stockFetchErr) {
+      console.warn(`[Shopify Sync] Could not fetch live stock for product ${trendsCode}:`, stockFetchErr);
+    }
+  }
+
+  // 3. Extract base price & variant specifications
   const primaryPrice = extractBasePrice(trendsProduct, normalizedRegion);
   const { optionName, specs } = buildVariantSpecs(trendsProduct, normalizedRegion, trendsCode);
   const skuList: string[] = specs.map((s) => s.canonicalSku);
   const variantLedgerEntries: { shopifyVariantId: string; stockCode: string; quantity: number }[] = [];
 
-  // 3. Execute Shopify Admin GraphQL if admin client is available
+  // 4. Execute Shopify Admin GraphQL if admin client is available
   if (admin) {
     // If not in local DB, check if product already exists in Shopify by tag/metafield
     if (!shopifyProductId) {
@@ -472,6 +498,21 @@ export async function syncTrendProductToShopify({
                 id
                 handle
                 title
+                totalInventory
+                variants(first: 50) {
+                  nodes {
+                    id
+                    sku
+                    inventoryQuantity
+                    availableForSale
+                    inventoryPolicy
+                    inventoryItem {
+                      id
+                      sku
+                      tracked
+                    }
+                  }
+                }
               }
             }
           }`,
@@ -616,8 +657,13 @@ export async function syncTrendProductToShopify({
                 nodes {
                   id
                   sku
+                  inventoryQuantity
+                  availableForSale
+                  inventoryPolicy
                   inventoryItem {
                     id
+                    sku
+                    tracked
                   }
                 }
               }
@@ -762,9 +808,13 @@ export async function syncTrendProductToShopify({
                   id
                   title
                   price
+                  inventoryQuantity
+                  availableForSale
+                  inventoryPolicy
                   inventoryItem {
                     id
                     sku
+                    tracked
                   }
                 }
                 userErrors {
@@ -952,13 +1002,18 @@ export async function syncTrendProductToShopify({
           `#graphql
           query getProductVariants($id: ID!) {
             product(id: $id) {
+              totalInventory
               variants(first: 50) {
                 nodes {
                   id
                   sku
+                  inventoryQuantity
+                  availableForSale
+                  inventoryPolicy
                   inventoryItem {
                     id
                     sku
+                    tracked
                   }
                 }
               }

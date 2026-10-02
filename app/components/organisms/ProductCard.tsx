@@ -40,8 +40,13 @@ export const ProductCard: React.FC<ProductCardProps> = ({
       : [];
 
   // Calculate total stock across all variants/stock items
-  const totalStock = product.stock?.reduce((acc, curr) => acc + (curr.quantity || 0), 0) || 0;
-  const nextShipment = product.stock?.find((s) => s.next_shipment && s.next_shipment > 0);
+  const stockList = Array.isArray(product.stock) ? product.stock : [];
+  const hasStock = stockList.length > 0;
+  const totalStock = hasStock
+    ? stockList.reduce((acc, curr) => acc + (typeof curr.quantity === "number" ? curr.quantity : Number(curr.quantity) || 0), 0)
+    : null;
+  const nextShipment = stockList.find((s) => s.next_shipment && s.next_shipment > 0);
+  const isIndent = Boolean(product.pricing?.some((p) => p.type?.toLowerCase() === "indent"));
 
   return (
     <div
@@ -242,6 +247,8 @@ export const ProductCard: React.FC<ProductCardProps> = ({
           <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
             <StockBadge
               quantity={totalStock}
+              isUntracked={!hasStock && isIndent}
+              pricingType={product.pricing?.[0]?.type}
               nextShipment={nextShipment?.next_shipment}
               dueDate={nextShipment?.due_date}
               size="sm"

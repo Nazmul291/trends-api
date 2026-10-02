@@ -34,7 +34,7 @@ export const ProductGrid: React.FC<ProductGridProps> = ({ onProductClick }) => {
     fetchProducts({ bypassCache: true, pageNo: 1 });
   };
 
-  if (status === "loading" && products.length === 0) {
+  if (status === "loading") {
     return (
       <div
         style={{
@@ -44,7 +44,7 @@ export const ProductGrid: React.FC<ProductGridProps> = ({ onProductClick }) => {
           width: "100%",
         }}
       >
-        {Array.from({ length: 8 }).map((_, i) => (
+        {Array.from({ length: 12 }).map((_, i) => (
           <CardSkeleton key={i} />
         ))}
       </div>

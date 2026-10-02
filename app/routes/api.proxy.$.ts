@@ -107,6 +107,11 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   queryParams.delete("region");
   queryParams.delete("bypassCache");
 
+  // Default products catalog endpoint to 50 items per batch/page
+  if (endpoint === "products" && !queryParams.has("page_size")) {
+    queryParams.set("page_size", "50");
+  }
+
   const cacheKey = CacheKeyBuilder.custom(region, endpoint, queryParams.toString());
 
   // 1. Check Cache Layer
@@ -137,6 +142,45 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       params: queryParams,
       settings: appSettings,
     });
+
+    // If fetching the product catalog list, enrich each product with live/cached stock
+    if (endpoint === "products" && upstreamRes.data && typeof upstreamRes.data === "object") {
+      const listData = upstreamRes.data as any;
+      if (Array.isArray(listData.data) && listData.data.length > 0) {
+        await Promise.all(
+          listData.data.map(async (prod: any) => {
+            if ((!prod.stock || prod.stock.length === 0) && prod.code) {
+              try {
+                const stockCacheKey = CacheKeyBuilder.stock(region, String(prod.code));
+                const cachedStock = await cacheAdapter.get<any[]>(stockCacheKey);
+                if (cachedStock && Array.isArray(cachedStock)) {
+                  prod.stock = cachedStock;
+                } else {
+                  const stockRes = await TrendsApiClient.request<any>(region, `stock/${prod.code}`, {
+                    settings: appSettings,
+                  });
+                  const items = stockRes?.data?.data || [];
+                  prod.stock = items;
+                  if (items.length > 0) {
+                    await cacheAdapter.set(stockCacheKey, items, DEFAULT_CACHE_CONFIG.stockTtl);
+                  }
+                }
+              } catch {
+                prod.stock = [];
+              }
+            }
+          })
+        );
+      }
+    }
+
+    // If fetching a single product, ensure single-object normalization (upstream returns array)
+    if (endpoint.startsWith("products/") && upstreamRes.data && typeof upstreamRes.data === "object") {
+      const showData = upstreamRes.data as any;
+      if (Array.isArray(showData.data) && showData.data.length > 0) {
+        showData.data = showData.data[0];
+      }
+    }
 
     // 3. Populate Cache
     if (!bypassCache && ttl > 0 && upstreamRes.data) {
@@ -256,9 +300,13 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       };
 
       let productToSync = body.product || body.trendsProduct;
+      if (Array.isArray(productToSync)) {
+        productToSync = productToSync[0];
+      }
       if (!productToSync && body.productId) {
         const showRes = await TrendsApiClient.request<ProductShowData>(region, `products/${body.productId}`, { settings: appSettings });
-        productToSync = showRes.data?.data;
+        const rawShow = showRes.data?.data;
+        productToSync = Array.isArray(rawShow) ? rawShow[0] : rawShow;
       }
 
       if (!productToSync) {

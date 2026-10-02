@@ -49,7 +49,7 @@ export function getMockProducts(region: Region): ProductListData {
     country: region.toUpperCase(),
     page_count: 1,
     page_current: 1,
-    page_size: 24,
+    page_size: 50,
     total_items: 6,
     data: [
       {
@@ -232,10 +232,11 @@ export function getMockSingleProduct(productId: string | number, region: Region)
 
 export function getMockStock(productId: string | number, region: Region): StockListData {
   const prod = getMockSingleProduct(productId, region).data;
+  const singleProd = Array.isArray(prod) ? prod[0] : prod;
   return {
     status: "success",
     country: region.toUpperCase(),
-    data: prod.stock || [],
+    data: singleProd?.stock || [],
   };
 }
 

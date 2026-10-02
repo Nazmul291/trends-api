@@ -190,13 +190,16 @@ export interface ProductListData {
 export interface ProductShowData {
   status: string;
   country: string;
-  data: ProductData;
+  data: ProductData | ProductData[];
 }
 
 export interface ListProductsQuery {
+  page_size?: number;
   category_no?: number | string;
   page_no?: number;
   last_updated?: string;
+  inc_discontinued?: boolean;
+  inc_inactive?: boolean;
   [key: string]: unknown;
 }
 
