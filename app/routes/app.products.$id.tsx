@@ -126,6 +126,14 @@ export default function ProductDetailPage() {
   const primaryPricing = product.pricing?.[0];
   const totalStock = stock.reduce((sum, item) => sum + (item.quantity || 0), 0);
 
+  // Normalize colours: live API may return a string or string[] — always coerce to string[]
+  const productColours: string[] = Array.isArray(product.colours)
+    ? product.colours
+    : typeof product.colours === "string" && (product.colours as string).length > 0
+      ? (product.colours as string).split(",").map((c) => c.trim())
+      : [];
+
+
   const adminNumericId = shopifyNumericId || shopifyProductId?.split("/").pop();
   const shopSubdomain = shopifyShop ? shopifyShop.replace(".myshopify.com", "") : null;
   const adminProductUrl = adminNumericId
@@ -490,13 +498,13 @@ export default function ProductDetailPage() {
           )}
 
           {/* Available Colours */}
-          {product.colours && product.colours.length > 0 && (
+          {productColours.length > 0 && (
             <div>
               <span style={{ fontSize: "12px", fontWeight: 600, color: "#202223", display: "block", marginBottom: "6px" }}>
-                Available Colours ({product.colours.length})
+                Available Colours ({productColours.length})
               </span>
               <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
-                {product.colours.map((col, idx) => (
+                {productColours.map((col, idx) => (
                   <span
                     key={idx}
                     style={{

@@ -32,6 +32,13 @@ export const ProductCard: React.FC<ProductCardProps> = ({
     setHasImageError(false);
   }, [primaryImage]);
 
+  // Normalize colours: live API may return a string or string[] — always coerce to string[]
+  const colours: string[] = Array.isArray(product.colours)
+    ? product.colours
+    : typeof product.colours === "string" && (product.colours as string).length > 0
+      ? (product.colours as string).split(",").map((c) => c.trim())
+      : [];
+
   // Calculate total stock across all variants/stock items
   const totalStock = product.stock?.reduce((acc, curr) => acc + (curr.quantity || 0), 0) || 0;
   const nextShipment = product.stock?.find((s) => s.next_shipment && s.next_shipment > 0);
@@ -188,9 +195,9 @@ export const ProductCard: React.FC<ProductCardProps> = ({
           {product.name}
         </h4>
 
-        {product.colours && product.colours.length > 0 && (
+        {colours.length > 0 && (
           <div style={{ display: "flex", flexWrap: "wrap", gap: "4px" }}>
-            {product.colours.slice(0, 4).map((c, i) => (
+            {colours.slice(0, 4).map((c, i) => (
               <span
                 key={i}
                 style={{
@@ -204,9 +211,9 @@ export const ProductCard: React.FC<ProductCardProps> = ({
                 {c}
               </span>
             ))}
-            {product.colours.length > 4 && (
+            {colours.length > 4 && (
               <span style={{ fontSize: "10px", color: "#8c9196" }}>
-                +{product.colours.length - 4} more
+                +{colours.length - 4} more
               </span>
             )}
           </div>
