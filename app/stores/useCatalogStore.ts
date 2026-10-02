@@ -46,6 +46,7 @@ interface CatalogState {
     categoryNo?: number | string | null;
     pageNo?: number;
     search?: string;
+    incDiscontinued?: boolean;
     bypassCache?: boolean;
   }) => Promise<void>;
   fetchSyncStatuses: (codes?: string[]) => Promise<void>;
@@ -53,6 +54,7 @@ interface CatalogState {
   deleteProductFromShopify: (product: ProductData) => Promise<{ success: boolean; error?: string }>;
   setSelectedCategory: (categoryId: number | string | null) => void;
   setSearchQuery: (query: string) => void;
+  setIncDiscontinued: (inc: boolean) => void;
   setPage: (pageNo: number) => void;
   resetFilters: () => void;
   resetCatalog: () => void;
@@ -146,6 +148,7 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
     const categoryNo = options.categoryNo !== undefined ? options.categoryNo : get().filters.categoryNo;
     const pageNo = options.pageNo !== undefined ? options.pageNo : get().pagination.pageCurrent;
     const searchQuery = options.search !== undefined ? options.search : get().filters.searchQuery;
+    const incDiscontinued = options.incDiscontinued !== undefined ? options.incDiscontinued : get().filters.incDiscontinued;
 
     set({
       productsStatus: "loading",
@@ -154,6 +157,7 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
         ...get().filters,
         categoryNo,
         searchQuery,
+        incDiscontinued,
       },
     });
 
@@ -165,6 +169,10 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
 
       if (categoryNo !== null && categoryNo !== undefined && categoryNo !== "") {
         queryParams.set("category_no", String(categoryNo));
+      }
+
+      if (incDiscontinued) {
+        queryParams.set("inc_discontinued", "true");
       }
 
       if (options.bypassCache) {
@@ -183,16 +191,32 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
       const envelope = (await res.json()) as ApiProxyResponse<ProductListData>;
       const listData = envelope.data;
 
-      // Filter locally if searchQuery is provided
+      // Filter locally if searchQuery is provided (defensive null-safe conversion)
       let items = listData?.data || [];
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase().trim();
-        items = items.filter(
-          (p) =>
-            p.name.toLowerCase().includes(q) ||
-            p.code.toLowerCase().includes(q) ||
-            p.description?.toLowerCase().includes(q)
-        );
+        items = items.filter((p) => {
+          const name = String(p.name || "").toLowerCase();
+          const code = String(p.code || "").toLowerCase();
+          const desc = String(p.description || "").toLowerCase();
+          const cats = Array.isArray(p.categories)
+            ? p.categories.map((c) => String(c.name || "")).join(" ").toLowerCase()
+            : "";
+          const features = Array.isArray(p.features) ? p.features.join(" ").toLowerCase() : "";
+          const colours = Array.isArray(p.colours)
+            ? p.colours.join(" ").toLowerCase()
+            : typeof p.colours === "string"
+              ? String(p.colours).toLowerCase()
+              : "";
+          return (
+            name.includes(q) ||
+            code.includes(q) ||
+            desc.includes(q) ||
+            cats.includes(q) ||
+            features.includes(q) ||
+            colours.includes(q)
+          );
+        });
       }
 
       const pageSize = listData?.page_size || 50;
@@ -214,7 +238,7 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
 
       // Automatically fetch sync status for returned products
       if (items.length > 0) {
-        get().fetchSyncStatuses(items.map((p) => p.code));
+        get().fetchSyncStatuses(items.map((p) => String(p.code)));
       }
     } catch (err: unknown) {
       if ((err as Error)?.name === "AbortError") return;
@@ -261,6 +285,14 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
     set((state) => ({
       filters: { ...state.filters, searchQuery: query },
     }));
+  },
+
+  setIncDiscontinued: (inc: boolean) => {
+    set((state) => ({
+      filters: { ...state.filters, incDiscontinued: inc },
+      pagination: { ...state.pagination, pageCurrent: 1 },
+    }));
+    get().fetchProducts({ incDiscontinued: inc, pageNo: 1 });
   },
 
   setPage: (pageNo: number) => {
@@ -350,7 +382,7 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
 
   resetFilters: () => {
     set({ filters: DEFAULT_FILTERS });
-    get().fetchProducts({ categoryNo: undefined, pageNo: 1, search: "" });
+    get().fetchProducts({ categoryNo: null, pageNo: 1, search: "", incDiscontinued: false });
   },
 
   resetCatalog: () => {

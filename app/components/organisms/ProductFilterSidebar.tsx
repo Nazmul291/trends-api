@@ -1,20 +1,38 @@
-import React, { useEffect } from "react";
+import React from "react";
 import { useCatalogStore } from "../../stores/useCatalogStore";
 
+export interface CatalogCategoryOption {
+  id: string; // The category_no query parameter recognized by Trends API
+  name: string;
+  icon?: string;
+}
+
+/**
+ * Top 6 high-volume catalog categories derived from real Trends API catalog data:
+ * - Leisure & Outdoors (10-0): 578 products
+ * - Bags (1-0): 441 products
+ * - Drinkware (4-0): 346 products
+ * - Technology (12-0): 205 products
+ * - Apparel (14-0): 187 products
+ * - Pens & Writing (13-0): 167 products
+ */
+export const TOP_CATALOG_CATEGORIES: CatalogCategoryOption[] = [
+  { id: "4-0", name: "Drinkware", icon: "🍶" },
+  { id: "1-0", name: "Bags", icon: "🎒" },
+  { id: "10-0", name: "Leisure & Outdoors", icon: "🏕️" },
+  { id: "13-0", name: "Pens & Writing", icon: "🖊️" },
+  { id: "14-0", name: "Apparel", icon: "👕" },
+  { id: "12-0", name: "Technology", icon: "⚡" },
+];
+
 export const ProductFilterSidebar: React.FC = () => {
-  const categories = useCatalogStore((s) => s.categories);
-  const categoriesStatus = useCatalogStore((s) => s.categoriesStatus);
   const selectedCategory = useCatalogStore((s) => s.filters.categoryNo);
   const incDiscontinued = useCatalogStore((s) => s.filters.incDiscontinued);
-  const fetchCategories = useCatalogStore((s) => s.fetchCategories);
   const setSelectedCategory = useCatalogStore((s) => s.setSelectedCategory);
+  const setIncDiscontinued = useCatalogStore((s) => s.setIncDiscontinued);
   const resetFilters = useCatalogStore((s) => s.resetFilters);
 
-  useEffect(() => {
-    if (categories.length === 0 && categoriesStatus === "idle") {
-      fetchCategories();
-    }
-  }, [categories.length, categoriesStatus, fetchCategories]);
+  const isAllSelected = selectedCategory === null || selectedCategory === "" || selectedCategory === undefined;
 
   return (
     <div
@@ -29,14 +47,22 @@ export const ProductFilterSidebar: React.FC = () => {
         width: "100%",
         maxWidth: "100%",
         boxSizing: "border-box",
-        overflow: "hidden",
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", boxSizing: "border-box" }}>
+      {/* Header */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          width: "100%",
+          boxSizing: "border-box",
+        }}
+      >
         <h3 style={{ fontSize: "14px", fontWeight: 700, color: "#202223", margin: 0 }}>
           Categories
         </h3>
-        {selectedCategory !== null && (
+        {!isAllSelected && (
           <button
             type="button"
             onClick={() => setSelectedCategory(null)}
@@ -55,28 +81,33 @@ export const ProductFilterSidebar: React.FC = () => {
         )}
       </div>
 
+      {/* Category List Wrapper with generous top padding to eliminate vertical clipping */}
       <div
+        className="trends-category-list pt-2"
         style={{
           display: "flex",
           flexDirection: "column",
-          gap: "4px",
-          maxHeight: "360px",
+          gap: "6px",
+          padding: "6px 2px 2px 2px",
+          paddingTop: "8px",
+          maxHeight: "380px",
           overflowY: "auto",
           width: "100%",
           boxSizing: "border-box",
         }}
       >
+        {/* All Categories Button */}
         <button
           type="button"
           onClick={() => setSelectedCategory(null)}
           style={{
             textAlign: "left",
-            padding: "8px 12px",
-            borderRadius: "6px",
+            padding: "9px 12px",
+            borderRadius: "8px",
             border: "none",
-            backgroundColor: selectedCategory === null ? "#f1f2f3" : "transparent",
-            color: selectedCategory === null ? "#202223" : "#5c5f62",
-            fontWeight: selectedCategory === null ? 700 : 500,
+            backgroundColor: isAllSelected ? "#e6f4ea" : "transparent",
+            color: isAllSelected ? "#008060" : "#202223",
+            fontWeight: isAllSelected ? 700 : 500,
             fontSize: "13px",
             cursor: "pointer",
             width: "100%",
@@ -84,13 +115,36 @@ export const ProductFilterSidebar: React.FC = () => {
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            transition: "all 0.15s ease-in-out",
+          }}
+          onMouseEnter={(e) => {
+            if (!isAllSelected) e.currentTarget.style.backgroundColor = "#f6f6f7";
+          }}
+          onMouseLeave={(e) => {
+            if (!isAllSelected) e.currentTarget.style.backgroundColor = "transparent";
           }}
         >
-          All Categories
+          <span style={{ fontSize: "14px", lineHeight: 1 }}>🏷️</span>
+          <span style={{ flex: "1 1 0%", minWidth: 0 }}>All Categories</span>
+          {isAllSelected && (
+            <span
+              style={{
+                width: "6px",
+                height: "6px",
+                borderRadius: "50%",
+                backgroundColor: "#008060",
+                flexShrink: 0,
+              }}
+            />
+          )}
         </button>
 
-        {categories.map((cat) => {
-          const isSelected = String(selectedCategory) === String(cat.id) || selectedCategory === cat.number;
+        {/* Top 6 Valid Active Categories */}
+        {TOP_CATALOG_CATEGORIES.map((cat) => {
+          const isSelected = String(selectedCategory) === String(cat.id);
           return (
             <button
               key={cat.id}
@@ -98,11 +152,11 @@ export const ProductFilterSidebar: React.FC = () => {
               onClick={() => setSelectedCategory(cat.id)}
               style={{
                 textAlign: "left",
-                padding: "8px 12px",
-                borderRadius: "6px",
+                padding: "9px 12px",
+                borderRadius: "8px",
                 border: "none",
-                backgroundColor: isSelected ? "#f1f2f3" : "transparent",
-                color: isSelected ? "#008060" : "#5c5f62",
+                backgroundColor: isSelected ? "#e6f4ea" : "transparent",
+                color: isSelected ? "#008060" : "#202223",
                 fontWeight: isSelected ? 700 : 500,
                 fontSize: "13px",
                 cursor: "pointer",
@@ -113,10 +167,20 @@ export const ProductFilterSidebar: React.FC = () => {
                 maxWidth: "100%",
                 boxSizing: "border-box",
                 gap: "8px",
+                transition: "all 0.15s ease-in-out",
+              }}
+              onMouseEnter={(e) => {
+                if (!isSelected) e.currentTarget.style.backgroundColor = "#f6f6f7";
+              }}
+              onMouseLeave={(e) => {
+                if (!isSelected) e.currentTarget.style.backgroundColor = "transparent";
               }}
             >
               <span
                 style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px",
                   overflow: "hidden",
                   textOverflow: "ellipsis",
                   whiteSpace: "nowrap",
@@ -124,24 +188,28 @@ export const ProductFilterSidebar: React.FC = () => {
                   minWidth: 0,
                 }}
               >
-                {cat.name}
+                {cat.icon && <span style={{ fontSize: "14px", lineHeight: 1 }}>{cat.icon}</span>}
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {cat.name}
+                </span>
               </span>
-              {cat.number && (
+              {isSelected && (
                 <span
                   style={{
-                    fontSize: "11px",
-                    color: "#8c9196",
+                    width: "6px",
+                    height: "6px",
+                    borderRadius: "50%",
+                    backgroundColor: "#008060",
                     flexShrink: 0,
                   }}
-                >
-                  #{cat.number}
-                </span>
+                />
               )}
             </button>
           );
         })}
       </div>
 
+      {/* Discontinued items checkbox */}
       <div style={{ paddingTop: "12px", borderTop: "1px solid #f1f2f3", width: "100%", boxSizing: "border-box" }}>
         <label
           style={{
@@ -158,7 +226,7 @@ export const ProductFilterSidebar: React.FC = () => {
           <input
             type="checkbox"
             checked={incDiscontinued}
-            onChange={(e) => fetchCategories({ incDiscontinued: e.target.checked })}
+            onChange={(e) => setIncDiscontinued(e.target.checked)}
             style={{ borderRadius: "4px", accentColor: "#008060", flexShrink: 0 }}
           />
           <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -167,11 +235,12 @@ export const ProductFilterSidebar: React.FC = () => {
         </label>
       </div>
 
+      {/* Reset Filters button */}
       <button
         type="button"
         onClick={() => resetFilters()}
         style={{
-          padding: "8px",
+          padding: "9px 12px",
           backgroundColor: "#f6f6f7",
           border: "1px solid #c9cccf",
           borderRadius: "6px",
@@ -181,6 +250,13 @@ export const ProductFilterSidebar: React.FC = () => {
           cursor: "pointer",
           width: "100%",
           boxSizing: "border-box",
+          transition: "all 0.15s ease-in-out",
+        }}
+        onMouseEnter={(e) => {
+          e.currentTarget.style.backgroundColor = "#e4e5e7";
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.backgroundColor = "#f6f6f7";
         }}
       >
         Reset Filters
