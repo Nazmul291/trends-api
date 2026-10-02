@@ -32,6 +32,10 @@ export interface AppSettingsData {
   lastSyncedAt: Date | string | null;
   syncStatus: "idle" | "running" | "failed" | string;
   syncErrorMessage: string | null;
+  // Inventory Location Strategy
+  inventorySyncMode: "single" | "split_equal";
+  targetLocationId: string | null;
+  splitLocationIds: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +93,11 @@ export function normalizeSyncBatchSize(size?: number | string | null): number {
   return Math.min(100, Math.max(10, parsed));
 }
 
+export function normalizeInventorySyncMode(mode?: string | null): "single" | "split_equal" {
+  if (mode === "split_equal") return "split_equal";
+  return "single";
+}
+
 // ---------------------------------------------------------------------------
 // Environment variable fallback
 // ---------------------------------------------------------------------------
@@ -106,6 +115,9 @@ function getEnvFallback(): AppSettingsData {
     lastSyncedAt: null,
     syncStatus: "idle",
     syncErrorMessage: null,
+    inventorySyncMode: "single",
+    targetLocationId: null,
+    splitLocationIds: [],
   };
 }
 
@@ -138,6 +150,9 @@ export async function getAppSettings(shop: string): Promise<AppSettingsData> {
         lastSyncedAt: record.lastSyncedAt,
         syncStatus: record.syncStatus || "idle",
         syncErrorMessage: record.syncErrorMessage || null,
+        inventorySyncMode: normalizeInventorySyncMode(record.inventorySyncMode),
+        targetLocationId: record.targetLocationId || null,
+        splitLocationIds: Array.isArray(record.splitLocationIds) ? record.splitLocationIds : [],
       };
       setCache(shop, data);
       return data;
@@ -157,7 +172,7 @@ export async function getAppSettings(shop: string): Promise<AppSettingsData> {
  */
 export async function saveAppSettings(
   shop: string,
-  settings: Partial<AppSettingsData>
+  settings: Partial<AppSettingsData> & Record<string, any>
 ): Promise<AppSettingsData> {
   // Validate: at least one region must be enabled
   if (settings.enabledRegions !== undefined) {
@@ -167,6 +182,10 @@ export async function saveAppSettings(
     }
     settings = { ...settings, enabledRegions: normalized };
   }
+
+  const rawMode = settings.inventorySyncMode ?? settings.inventory_sync_mode;
+  const rawTargetLoc = settings.targetLocationId ?? settings.target_location_id;
+  const rawSplitLocs = settings.splitLocationIds ?? settings.split_location_ids;
 
   const record = await prisma.appSettings.upsert({
     where: { shop },
@@ -183,6 +202,9 @@ export async function saveAppSettings(
       lastSyncedAt: settings.lastSyncedAt ?? null,
       syncStatus: settings.syncStatus ?? "idle",
       syncErrorMessage: settings.syncErrorMessage ?? null,
+      inventorySyncMode: rawMode !== undefined ? normalizeInventorySyncMode(rawMode) : "single",
+      targetLocationId: rawTargetLoc !== undefined ? rawTargetLoc : null,
+      splitLocationIds: Array.isArray(rawSplitLocs) ? rawSplitLocs : [],
     },
     update: {
       ...(settings.trendsApiKey !== undefined && { trendsApiKey: settings.trendsApiKey }),
@@ -198,6 +220,9 @@ export async function saveAppSettings(
       ...(settings.lastSyncedAt !== undefined && { lastSyncedAt: settings.lastSyncedAt }),
       ...(settings.syncStatus !== undefined && { syncStatus: settings.syncStatus }),
       ...(settings.syncErrorMessage !== undefined && { syncErrorMessage: settings.syncErrorMessage }),
+      ...(rawMode !== undefined && { inventorySyncMode: normalizeInventorySyncMode(rawMode) }),
+      ...(rawTargetLoc !== undefined && { targetLocationId: rawTargetLoc }),
+      ...(rawSplitLocs !== undefined && { splitLocationIds: Array.isArray(rawSplitLocs) ? rawSplitLocs : [] }),
     },
   });
 
@@ -213,6 +238,9 @@ export async function saveAppSettings(
     lastSyncedAt: record.lastSyncedAt,
     syncStatus: record.syncStatus || "idle",
     syncErrorMessage: record.syncErrorMessage || null,
+    inventorySyncMode: normalizeInventorySyncMode(record.inventorySyncMode),
+    targetLocationId: record.targetLocationId || null,
+    splitLocationIds: Array.isArray(record.splitLocationIds) ? record.splitLocationIds : [],
   };
 
   // Bust cache so next read is fresh

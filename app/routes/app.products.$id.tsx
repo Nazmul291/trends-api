@@ -1,7 +1,9 @@
 import React, { useEffect, useState } from "react";
-import type { LoaderFunctionArgs } from "react-router";
-import { useParams, useNavigate } from "react-router";
+import type { LoaderFunctionArgs, ActionFunctionArgs } from "react-router";
+import { useParams, useNavigate, useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
+import prisma from "../db.server";
+import { getAppSettings } from "../../server/settings/app-settings.service";
 import { useProductDetailStore } from "../stores/useProductDetailStore";
 import { useRegionStore } from "../stores/useRegionStore";
 import { StatusBadge } from "../components/atoms/StatusBadge";
@@ -67,14 +69,164 @@ function getVariantPrice(
   return null;
 }
 
-export const loader = async ({ request }: LoaderFunctionArgs) => {
-  await authenticate.admin(request);
-  return null;
+export const loader = async ({ request, params }: LoaderFunctionArgs) => {
+  const { session, admin } = await authenticate.admin(request);
+  const shop = session.shop;
+  const productId = params.id;
+
+  // 1. Fetch live Shopify store locations
+  let locations: Array<{ id: string; name: string; isPrimary: boolean }> = [];
+  try {
+    const locRes = await admin.graphql(
+      `#graphql
+      query getLocations {
+        locations(first: 20, includeInactive: false) {
+          nodes {
+            id
+            name
+            isPrimary
+          }
+        }
+      }`
+    );
+    const locJson = await locRes.json();
+    locations = locJson?.data?.locations?.nodes || [];
+  } catch (err) {
+    console.warn("[ProductDetails] Failed to fetch Shopify locations:", err);
+  }
+
+  // 2. Fetch global app settings
+  const settings = await getAppSettings(shop);
+
+  // 3. Fetch product sync record if already synced or customized
+  let productSync = null;
+  if (productId) {
+    productSync = await prisma.trendProductSync.findFirst({
+      where: {
+        shop,
+        trendsCode: String(productId),
+      },
+      select: {
+        id: true,
+        shopifyProductId: true,
+        inventorySyncMode: true,
+        targetLocationId: true,
+        splitLocationIds: true,
+        lastSyncedAt: true,
+      },
+    });
+  }
+
+  const primaryLocId = locations.find((l) => l.isPrimary)?.id || locations[0]?.id || "";
+
+  return {
+    shop,
+    locations,
+    globalSettings: {
+      inventorySyncMode: settings.inventorySyncMode || "single",
+      targetLocationId: settings.targetLocationId || primaryLocId,
+      splitLocationIds: settings.splitLocationIds || [],
+    },
+    productSync: productSync
+      ? {
+          ...productSync,
+          lastSyncedAt: productSync.lastSyncedAt ? productSync.lastSyncedAt.toISOString() : null,
+        }
+      : null,
+  };
+};
+
+export const action = async ({ request, params }: ActionFunctionArgs) => {
+  const { session } = await authenticate.admin(request);
+  const shop = session.shop;
+  const productId = params.id;
+
+  if (!productId) {
+    return { success: false, error: "Missing product ID" };
+  }
+
+  const formData = await request.formData();
+  const intent = formData.get("intent");
+
+  if (intent === "saveLocationOverride") {
+    const useOverride = formData.get("useOverride") === "true";
+    const inventorySyncMode = useOverride
+      ? (String(formData.get("inventorySyncMode") || "single") as "single" | "split_equal")
+      : null;
+    const targetLocationId = useOverride
+      ? formData.get("targetLocationId")
+        ? String(formData.get("targetLocationId")).trim()
+        : null
+      : null;
+    const splitLocationIds = useOverride
+      ? formData.getAll("splitLocationIds").map(String).map((s) => s.trim()).filter(Boolean)
+      : [];
+
+    if (useOverride) {
+      if (inventorySyncMode === "single" && !targetLocationId) {
+        return { success: false, error: "Please select a target Shopify location for Single Location mode." };
+      }
+      if (inventorySyncMode === "split_equal" && splitLocationIds.length < 2) {
+        return { success: false, error: "Please select at least 2 Shopify locations for Equal Split mode." };
+      }
+    }
+
+    try {
+      const existing = await prisma.trendProductSync.findFirst({
+        where: { shop, trendsCode: String(productId) },
+      });
+
+      if (existing) {
+        await prisma.trendProductSync.update({
+          where: { id: existing.id },
+          data: {
+            inventorySyncMode,
+            targetLocationId,
+            splitLocationIds,
+          },
+        });
+      } else {
+        await prisma.trendProductSync.create({
+          data: {
+            shop,
+            trendsCode: String(productId),
+            shopifyProductId: `pending-sync-${productId}`,
+            region: "au",
+            inventorySyncMode,
+            targetLocationId,
+            splitLocationIds,
+          },
+        });
+      }
+
+      return {
+        success: true,
+        message: useOverride
+          ? "Custom location distribution override saved for this product."
+          : "Product reset to use storewide global location settings.",
+      };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : "Failed to save override." };
+    }
+  }
+
+  return { success: false, error: "Unknown action" };
 };
 
 export default function ProductDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+
+  const loaderData = useLoaderData<typeof loader>();
+  const locations = loaderData?.locations || [];
+  const globalSettings = loaderData?.globalSettings || {
+    inventorySyncMode: "single",
+    targetLocationId: "",
+    splitLocationIds: [],
+  };
+  const productSync = loaderData?.productSync;
+
+  const fetcher = useFetcher<typeof action>();
 
   const currentRegion = useRegionStore((s) => s.currentRegion);
 
@@ -108,6 +260,75 @@ export default function ProductDetailPage() {
 
   const [activeImageIndex, setActiveImageIndex] = useState(0);
   const [detailImageError, setDetailImageError] = useState(false);
+
+  // Determine initial override state
+  const hasExistingOverride = Boolean(
+    productSync?.inventorySyncMode ||
+    productSync?.targetLocationId ||
+    (productSync?.splitLocationIds && productSync.splitLocationIds.length > 0)
+  );
+
+  const [useOverride, setUseOverride] = useState(hasExistingOverride);
+  const [productMode, setProductMode] = useState<"single" | "split_equal">(
+    (productSync?.inventorySyncMode as "single" | "split_equal") ||
+      globalSettings.inventorySyncMode ||
+      "single"
+  );
+  const [productTargetLoc, setProductTargetLoc] = useState<string>(
+    productSync?.targetLocationId || globalSettings.targetLocationId || locations[0]?.id || ""
+  );
+  const [productSplitLocs, setProductSplitLocs] = useState<string[]>(
+    productSync?.splitLocationIds && productSync.splitLocationIds.length > 0
+      ? productSync.splitLocationIds
+      : globalSettings.splitLocationIds && globalSettings.splitLocationIds.length > 0
+      ? globalSettings.splitLocationIds
+      : locations.slice(0, 2).map((l) => l.id)
+  );
+
+  // Sync state if productSync changes
+  useEffect(() => {
+    if (productSync) {
+      const hasOverride = Boolean(
+        productSync.inventorySyncMode ||
+        productSync.targetLocationId ||
+        (productSync.splitLocationIds && productSync.splitLocationIds.length > 0)
+      );
+      setUseOverride(hasOverride);
+      if (productSync.inventorySyncMode) {
+        setProductMode(productSync.inventorySyncMode as "single" | "split_equal");
+      }
+      if (productSync.targetLocationId) {
+        setProductTargetLoc(productSync.targetLocationId);
+      }
+      if (productSync.splitLocationIds && productSync.splitLocationIds.length > 0) {
+        setProductSplitLocs(productSync.splitLocationIds);
+      }
+    }
+  }, [productSync]);
+
+  const handleSyncWithLocationOptions = () => {
+    if (useOverride) {
+      syncProductToShopify(undefined, {
+        inventorySyncMode: productMode,
+        targetLocationId: productTargetLoc,
+        splitLocationIds: productSplitLocs,
+      });
+    } else {
+      syncProductToShopify();
+    }
+  };
+
+  const handleSaveOverride = () => {
+    const formData = new FormData();
+    formData.append("intent", "saveLocationOverride");
+    formData.append("useOverride", useOverride ? "true" : "false");
+    if (useOverride) {
+      formData.append("inventorySyncMode", productMode);
+      formData.append("targetLocationId", productTargetLoc);
+      productSplitLocs.forEach((id: string) => formData.append("splitLocationIds", id));
+    }
+    fetcher.submit(formData, { method: "post" });
+  };
 
   useEffect(() => {
     setDetailImageError(false);
@@ -268,7 +489,7 @@ export default function ProductDetailPage() {
               variant="primary"
               size="sm"
               loading={syncStatus === "loading"}
-              onClick={() => syncProductToShopify()}
+              onClick={handleSyncWithLocationOptions}
               icon={
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
@@ -353,7 +574,7 @@ export default function ProductDetailPage() {
           <Button
             variant="outline"
             size="sm"
-            onClick={() => syncProductToShopify()}
+            onClick={handleSyncWithLocationOptions}
             style={{ color: "#991b1b", borderColor: "#fca5a5" }}
           >
             Retry Sync
@@ -579,6 +800,429 @@ export default function ProductDetailPage() {
           {/* Lead Times */}
           <LeadTimeIndicator leadTimes={leadTimes} />
         </div>
+      </div>
+
+      {/* Inventory Distribution Settings Card */}
+      <div
+        style={{
+          backgroundColor: "#ffffff",
+          borderRadius: "16px",
+          border: "1px solid #e1e3e5",
+          padding: "24px",
+          boxShadow: "0 1px 3px rgba(0,0,0,0.04)",
+          display: "flex",
+          flexDirection: "column",
+          gap: "16px",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "flex-start",
+            flexWrap: "wrap",
+            gap: "12px",
+          }}
+        >
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <h3 style={{ fontSize: "16px", fontWeight: 700, margin: 0, color: "#202223" }}>
+                Inventory Distribution Settings
+              </h3>
+              <span
+                style={{
+                  fontSize: "11px",
+                  fontWeight: 600,
+                  padding: "2px 8px",
+                  borderRadius: "10px",
+                  backgroundColor: useOverride ? "#fef3c7" : "#f1f2f3",
+                  color: useOverride ? "#92400e" : "#6d7175",
+                  border: `1px solid ${useOverride ? "#fde68a" : "#e1e3e5"}`,
+                }}
+              >
+                {useOverride ? "Product Override Active" : "Using Global Strategy"}
+              </span>
+            </div>
+            <p style={{ margin: "4px 0 0 0", fontSize: "13px", color: "#6d7175" }}>
+              Choose whether to adhere to storewide inventory routing or apply custom location allocation rules for this product.
+            </p>
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+            <Button
+              variant="primary"
+              size="sm"
+              loading={fetcher.state === "submitting"}
+              onClick={handleSaveOverride}
+            >
+              {fetcher.state === "submitting" ? "Saving..." : "Save Location Rules"}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              loading={syncStatus === "loading"}
+              onClick={handleSyncWithLocationOptions}
+            >
+              {syncStatus === "loading" ? "Syncing..." : isSynced ? "🔄 Re-sync Stock" : "Sync to Shopify"}
+            </Button>
+          </div>
+        </div>
+
+        {fetcher.data?.message && (
+          <div
+            style={{
+              padding: "10px 14px",
+              backgroundColor: "#f0fdf4",
+              border: "1px solid #bbf7d0",
+              borderRadius: "8px",
+              color: "#166534",
+              fontSize: "13px",
+              fontWeight: 600,
+            }}
+          >
+            ✓ {fetcher.data.message}
+          </div>
+        )}
+        {fetcher.data?.error && (
+          <div
+            style={{
+              padding: "10px 14px",
+              backgroundColor: "#fef2f2",
+              border: "1px solid #fecaca",
+              borderRadius: "8px",
+              color: "#991b1b",
+              fontSize: "13px",
+              fontWeight: 600,
+            }}
+          >
+            ⚠️ {fetcher.data.error}
+          </div>
+        )}
+
+        {/* Global Strategy Summary Box (when not overriding) */}
+        {!useOverride && (
+          <div
+            style={{
+              padding: "14px 16px",
+              backgroundColor: "#f9fafb",
+              borderRadius: "8px",
+              border: "1px solid #e1e3e5",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              flexWrap: "wrap",
+              gap: "8px",
+            }}
+          >
+            <div>
+              <span style={{ fontSize: "12px", fontWeight: 600, color: "#6d7175" }}>
+                Current Global Default Strategy:
+              </span>
+              <div style={{ fontSize: "13px", fontWeight: 600, color: "#202223", marginTop: "2px" }}>
+                {globalSettings.inventorySyncMode === "single"
+                  ? `Single Location: ${
+                      locations.find((l) => l.id === globalSettings.targetLocationId)?.name ||
+                      globalSettings.targetLocationId ||
+                      "Primary Location"
+                    }`
+                  : `Equal Split across ${
+                      globalSettings.splitLocationIds.length
+                    } locations (${globalSettings.splitLocationIds
+                      .map((id) => locations.find((l) => l.id === id)?.name || id)
+                      .join(", ")})`}
+              </div>
+            </div>
+            <span style={{ fontSize: "12px", color: "#6d7175" }}>
+              To change storewide rules, visit{" "}
+              <a href="/app/settings" style={{ color: "#008060", fontWeight: 600 }}>
+                Settings
+              </a>
+              .
+            </span>
+          </div>
+        )}
+
+        {/* Override Toggle Checkbox */}
+        <label
+          style={{
+            display: "flex",
+            alignItems: "flex-start",
+            gap: "10px",
+            padding: "12px 14px",
+            backgroundColor: useOverride ? "#fefce8" : "#f9fafb",
+            border: `1px solid ${useOverride ? "#fde047" : "#e1e3e5"}`,
+            borderRadius: "8px",
+            cursor: "pointer",
+            transition: "all 0.15s ease",
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={useOverride}
+            onChange={(e) => setUseOverride(e.target.checked)}
+            style={{ accentColor: "#008060", marginTop: "3px", width: "16px", height: "16px" }}
+          />
+          <div>
+            <span style={{ fontSize: "14px", fontWeight: 600, color: "#202223" }}>
+              Use custom location rules for this product (Override global settings)
+            </span>
+            <p style={{ margin: "2px 0 0 0", fontSize: "12px", color: "#6d7175" }}>
+              When checked, inventory synchronization for this product distributes stock according to the custom strategy below instead of global store settings.
+            </p>
+          </div>
+        </label>
+
+        {/* Revealed Strategy Controls when Override is Active */}
+        {useOverride && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "16px", marginTop: "4px" }}>
+            {/* Mode Radios */}
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
+                gap: "12px",
+              }}
+            >
+              {/* Single Mode Card */}
+              <div
+                onClick={() => setProductMode("single")}
+                style={{
+                  padding: "12px 14px",
+                  borderRadius: "8px",
+                  border: `2px solid ${productMode === "single" ? "#008060" : "#e1e3e5"}`,
+                  backgroundColor: productMode === "single" ? "#f3fdf7" : "#ffffff",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: "10px",
+                }}
+              >
+                <input
+                  type="radio"
+                  name="product_mode_choice"
+                  checked={productMode === "single"}
+                  onChange={() => setProductMode("single")}
+                  style={{ marginTop: "3px", accentColor: "#008060" }}
+                />
+                <div>
+                  <div style={{ fontSize: "13px", fontWeight: 600, color: "#202223" }}>
+                    Single Location Mode
+                  </div>
+                  <p style={{ margin: "2px 0 0 0", fontSize: "12px", color: "#6d7175" }}>
+                    Route 100% of this product's variant stock to one chosen Shopify location.
+                  </p>
+                </div>
+              </div>
+
+              {/* Split Mode Card */}
+              <div
+                onClick={() => setProductMode("split_equal")}
+                style={{
+                  padding: "12px 14px",
+                  borderRadius: "8px",
+                  border: `2px solid ${productMode === "split_equal" ? "#008060" : "#e1e3e5"}`,
+                  backgroundColor: productMode === "split_equal" ? "#f3fdf7" : "#ffffff",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: "10px",
+                }}
+              >
+                <input
+                  type="radio"
+                  name="product_mode_choice"
+                  checked={productMode === "split_equal"}
+                  onChange={() => setProductMode("split_equal")}
+                  style={{ marginTop: "3px", accentColor: "#008060" }}
+                />
+                <div>
+                  <div style={{ fontSize: "13px", fontWeight: 600, color: "#202223" }}>
+                    Split Equally Across Locations
+                  </div>
+                  <p style={{ margin: "2px 0 0 0", fontSize: "12px", color: "#6d7175" }}>
+                    Divide this product's stock equally among chosen locations with remainder preservation.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Single Location Dropdown */}
+            {productMode === "single" && (
+              <div
+                style={{
+                  padding: "14px 16px",
+                  backgroundColor: "#f9fafb",
+                  borderRadius: "8px",
+                  border: "1px solid #e1e3e5",
+                }}
+              >
+                <label
+                  htmlFor="productTargetLocation"
+                  style={{
+                    display: "block",
+                    fontSize: "13px",
+                    fontWeight: 600,
+                    color: "#202223",
+                    marginBottom: "6px",
+                  }}
+                >
+                  Target Shopify Location for this Product
+                </label>
+                <select
+                  id="productTargetLocation"
+                  value={productTargetLoc}
+                  onChange={(e) => setProductTargetLoc(e.target.value)}
+                  style={{
+                    width: "100%",
+                    maxWidth: "380px",
+                    padding: "8px 12px",
+                    borderRadius: "6px",
+                    border: "1px solid #c9cccf",
+                    fontSize: "13px",
+                    backgroundColor: "#ffffff",
+                    color: "#202223",
+                    outline: "none",
+                  }}
+                >
+                  <option value="" disabled>
+                    -- Select Target Location --
+                  </option>
+                  {locations.map((loc) => (
+                    <option key={loc.id} value={loc.id}>
+                      {loc.name} {loc.isPrimary ? "(Primary)" : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {/* Split Mode Checkboxes */}
+            {productMode === "split_equal" && (
+              <div
+                style={{
+                  padding: "14px 16px",
+                  backgroundColor: "#f9fafb",
+                  borderRadius: "8px",
+                  border: "1px solid #e1e3e5",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    marginBottom: "10px",
+                    flexWrap: "wrap",
+                    gap: "8px",
+                  }}
+                >
+                  <div>
+                    <label style={{ fontSize: "13px", fontWeight: 600, color: "#202223" }}>
+                      Participating Locations (Minimum 2 required)
+                    </label>
+                    <p style={{ margin: "2px 0 0 0", fontSize: "12px", color: "#6d7175" }}>
+                      Selected: {productSplitLocs.length} locations
+                    </p>
+                  </div>
+                  <div style={{ display: "flex", gap: "6px" }}>
+                    <button
+                      type="button"
+                      onClick={() => setProductSplitLocs(locations.map((l) => l.id))}
+                      style={{
+                        padding: "3px 8px",
+                        fontSize: "11px",
+                        fontWeight: 600,
+                        color: "#008060",
+                        backgroundColor: "#ffffff",
+                        border: "1px solid #c9cccf",
+                        borderRadius: "4px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Select All
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setProductSplitLocs([])}
+                      style={{
+                        padding: "3px 8px",
+                        fontSize: "11px",
+                        fontWeight: 600,
+                        color: "#6d7175",
+                        backgroundColor: "#ffffff",
+                        border: "1px solid #c9cccf",
+                        borderRadius: "4px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Clear All
+                    </button>
+                  </div>
+                </div>
+
+                {productSplitLocs.length < 2 && (
+                  <div
+                    style={{
+                      padding: "6px 10px",
+                      backgroundColor: "#fffbeb",
+                      border: "1px solid #fef3c7",
+                      borderRadius: "6px",
+                      color: "#b45309",
+                      fontSize: "12px",
+                      fontWeight: 600,
+                      marginBottom: "10px",
+                    }}
+                  >
+                    ⚠️ Select at least 2 locations for equal split distribution.
+                  </div>
+                )}
+
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))",
+                    gap: "8px",
+                  }}
+                >
+                  {locations.map((loc) => {
+                    const isChecked = productSplitLocs.includes(loc.id);
+                    return (
+                      <label
+                        key={loc.id}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "8px",
+                          padding: "8px 12px",
+                          backgroundColor: isChecked ? "#f0fdf4" : "#ffffff",
+                          border: `1px solid ${isChecked ? "#86efac" : "#e1e3e5"}`,
+                          borderRadius: "6px",
+                          cursor: "pointer",
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          onChange={() => {
+                            setProductSplitLocs((prev: string[]) =>
+                              prev.includes(loc.id)
+                                ? prev.filter((id: string) => id !== loc.id)
+                                : [...prev, loc.id]
+                            );
+                          }}
+                          style={{ accentColor: "#008060", width: "15px", height: "15px" }}
+                        />
+                        <span style={{ fontSize: "13px", fontWeight: 500, color: "#202223" }}>
+                          {loc.name} {loc.isPrimary ? "(Primary)" : ""}
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Real-Time Stock Breakdown Section */}

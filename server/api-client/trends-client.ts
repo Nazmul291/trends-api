@@ -204,15 +204,6 @@ export class TrendsApiClient {
       return getMockProducts(region) as unknown as T;
     }
     if (cleanPath.startsWith("orders")) {
-      if (options.method === "POST") {
-        const body = (options.body || {}) as Record<string, unknown>;
-        return {
-          order_number: `SO-${Math.floor(100000 + Math.random() * 900000)}`,
-          status: "Received",
-          ...body,
-          order_date: new Date().toISOString(),
-        } as unknown as T;
-      }
       return getMockOrders(region) as unknown as T;
     }
 

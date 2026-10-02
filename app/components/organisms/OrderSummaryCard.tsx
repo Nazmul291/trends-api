@@ -106,26 +106,155 @@ export const OrderSummaryCard: React.FC<OrderSummaryCardProps> = ({ order }) => 
         </div>
       )}
 
+      {/* Media & Tracking Actions */}
+      {(order.tracking || order.invoice || order.proof || order.photo) && (
+        <div
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            gap: "10px",
+            alignItems: "center",
+            padding: "12px",
+            backgroundColor: "#f4f6f8",
+            borderRadius: "8px",
+            border: "1px solid #e1e3e5",
+          }}
+        >
+          {order.tracking && (
+            <a
+              href={order.tracking}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "6px",
+                padding: "6px 12px",
+                backgroundColor: "#008060",
+                color: "#ffffff",
+                fontSize: "12px",
+                fontWeight: 600,
+                borderRadius: "6px",
+                textDecoration: "none",
+                transition: "background-color 0.15s ease",
+              }}
+            >
+              <span>🚚</span> Track Shipment
+            </a>
+          )}
+
+          {order.invoice && (
+            <a
+              href={order.invoice}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "6px",
+                padding: "6px 12px",
+                backgroundColor: "#ffffff",
+                color: "#2c6ecb",
+                border: "1px solid #c9cccf",
+                fontSize: "12px",
+                fontWeight: 600,
+                borderRadius: "6px",
+                textDecoration: "none",
+              }}
+            >
+              <span>📄</span> Invoice {order.invoice_number ? `(${order.invoice_number})` : "PDF"}
+            </a>
+          )}
+
+          {order.proof && (
+            <a
+              href={order.proof}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "6px",
+                padding: "6px 12px",
+                backgroundColor: "#ffffff",
+                color: "#5c5f62",
+                border: "1px solid #c9cccf",
+                fontSize: "12px",
+                fontWeight: 600,
+                borderRadius: "6px",
+                textDecoration: "none",
+              }}
+            >
+              <span>🎨</span> Artwork Proof
+            </a>
+          )}
+
+          {order.photo && (
+            <a
+              href={order.photo}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "6px",
+                padding: "6px 12px",
+                backgroundColor: "#ffffff",
+                color: "#5c5f62",
+                border: "1px solid #c9cccf",
+                fontSize: "12px",
+                fontWeight: 600,
+                borderRadius: "6px",
+                textDecoration: "none",
+              }}
+            >
+              <span>📷</span> Production Photo
+            </a>
+          )}
+        </div>
+      )}
+
       {order.time_stamps && (
         <div
           style={{
             display: "flex",
             flexWrap: "wrap",
-            gap: "12px",
-            paddingTop: "10px",
+            gap: "16px",
+            paddingTop: "12px",
             borderTop: "1px solid #f1f2f3",
             fontSize: "11px",
             color: "#6d7175",
           }}
         >
           {order.time_stamps.order_received && (
-            <span>Received: {formatDate(order.time_stamps.order_received)}</span>
+            <div>
+              <span style={{ color: "#8c9196" }}>Received: </span>
+              <strong style={{ color: "#202223" }}>{formatDate(order.time_stamps.order_received)}</strong>
+            </div>
+          )}
+          {order.time_stamps.last_proofed && (
+            <div>
+              <span style={{ color: "#8c9196" }}>Proofed: </span>
+              <strong style={{ color: "#202223" }}>{formatDate(order.time_stamps.last_proofed)}</strong>
+            </div>
+          )}
+          {order.time_stamps.order_approved && (
+            <div>
+              <span style={{ color: "#8c9196" }}>Approved: </span>
+              <strong style={{ color: "#202223" }}>{formatDate(order.time_stamps.order_approved)}</strong>
+            </div>
           )}
           {order.time_stamps.dispatch && (
-            <span>Dispatched: {formatDate(order.time_stamps.dispatch)}</span>
+            <div>
+              <span style={{ color: "#8c9196" }}>Dispatched: </span>
+              <strong style={{ color: "#008060" }}>{formatDate(order.time_stamps.dispatch)}</strong>
+            </div>
           )}
           {order.time_stamps.invoiced && (
-            <span>Invoiced: {formatDate(order.time_stamps.invoiced)}</span>
+            <div>
+              <span style={{ color: "#8c9196" }}>Invoiced: </span>
+              <strong style={{ color: "#202223" }}>{formatDate(order.time_stamps.invoiced)}</strong>
+            </div>
           )}
         </div>
       )}

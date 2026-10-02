@@ -330,6 +330,9 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         trendsProduct?: ProductData;
         syncLocks?: string[];
         isMock?: boolean;
+        inventorySyncMode?: "single" | "split_equal";
+        targetLocationId?: string | null;
+        splitLocationIds?: string[];
       };
 
       let productToSync = body.product || body.trendsProduct;
@@ -356,6 +359,9 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         region,
         syncLocks: body.syncLocks,
         isMock: body.isMock,
+        inventorySyncMode: body.inventorySyncMode,
+        targetLocationId: body.targetLocationId,
+        splitLocationIds: body.splitLocationIds,
       });
 
       return Response.json({
@@ -380,35 +386,26 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     }
   }
 
-  try {
-    const body = await request.json().catch(() => undefined);
-    const upstreamRes = await TrendsApiClient.request<unknown>(region, endpoint, {
-      method: request.method as "POST" | "PUT" | "DELETE",
-      body,
-      settings: appSettings,
-    });
-
-    const response: ApiProxyResponse<unknown> = {
-      success: true,
-      region,
-      cached: false,
-      timestamp: new Date().toISOString(),
-      data: upstreamRes.data,
-    };
-
-    return Response.json(response, { status: upstreamRes.status });
-  } catch (err: unknown) {
-    const errorObj = err as { status?: number; message?: string; data?: unknown };
+  // Trends API specification (OpenAPI 3.1.0) is strictly read-only (GET).
+  // Block any non-compliant mutations (e.g. POST /orders) to upstream endpoints.
+  if (endpoint.startsWith("orders")) {
     return Response.json(
       {
         success: false,
         region,
-        cached: false,
-        timestamp: new Date().toISOString(),
-        error: errorObj.message || "Upstream mutation failed",
-        details: errorObj.data,
+        error:
+          "The Trends API does not support outbound order creation (POST /orders). Orders must be created via distributor purchasing and tracked via GET /api/v1/orders.",
       },
-      { status: errorObj.status || 500 }
+      { status: 405 }
     );
   }
+
+  return Response.json(
+    {
+      success: false,
+      region,
+      error: `Method ${request.method} is not supported for upstream Trends endpoint '${endpoint}'. Trends API specification is read-only (GET).`,
+    },
+    { status: 405 }
+  );
 };

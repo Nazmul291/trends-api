@@ -40,6 +40,10 @@ model TrendProductSync {
   trendsCode       String
   region           String
   syncLocks        String[]           @default([])
+  // Per-product Inventory Distribution Override
+  inventorySyncMode String?
+  targetLocationId  String?
+  splitLocationIds  String[]           @default([])
   lastSyncedAt     DateTime           @default(now())
   createdAt        DateTime           @default(now())
   updatedAt        DateTime           @updatedAt
@@ -53,6 +57,7 @@ model TrendVariantSync {
   id               String           @id @default(uuid())
   productSyncId    String
   shopifyVariantId String           @unique
+  inventoryItemId  String?
   stockCode        String
   region           String
   lastStockQty     Int              @default(0)
@@ -61,6 +66,7 @@ model TrendVariantSync {
   productSync      TrendProductSync @relation(fields: [productSyncId], references: [id], onDelete: Cascade)
 
   @@index([stockCode, region])
+  @@index([inventoryItemId])
 }
 
 model TrendOrderDispatch {
@@ -96,6 +102,11 @@ model AppSettings {
   lastSyncedAt            DateTime?
   syncStatus              String   @default("idle")
   syncErrorMessage        String?
+
+  // Inventory Location Strategy
+  inventorySyncMode       String   @default("single")
+  targetLocationId        String?
+  splitLocationIds        String[] @default([])
 
   createdAt               DateTime @default(now())
   updatedAt               DateTime @updatedAt

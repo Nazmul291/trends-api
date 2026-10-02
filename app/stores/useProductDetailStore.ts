@@ -52,7 +52,14 @@ interface ProductDetailState {
   fetchLeadTimes: (options?: { bypassCache?: boolean }) => Promise<void>;
   loadProductDetailsWithStock: (productId: string | number) => Promise<void>;
   checkSyncStatus: (productId: string | number) => Promise<void>;
-  syncProductToShopify: (productOverride?: ProductData) => Promise<boolean>;
+  syncProductToShopify: (
+    productOverride?: ProductData,
+    locationOptions?: {
+      inventorySyncMode?: "single" | "split_equal";
+      targetLocationId?: string | null;
+      splitLocationIds?: string[];
+    }
+  ) => Promise<boolean>;
   deleteProductFromShopify: () => Promise<boolean>;
   clearProduct: () => void;
 }
@@ -242,7 +249,14 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
     }
   },
 
-  syncProductToShopify: async (productOverride?: ProductData) => {
+  syncProductToShopify: async (
+    productOverride?: ProductData,
+    locationOptions?: {
+      inventorySyncMode?: "single" | "split_equal";
+      targetLocationId?: string | null;
+      splitLocationIds?: string[];
+    }
+  ) => {
     const targetProduct = productOverride || get().product;
     if (!targetProduct) {
       set({
@@ -263,6 +277,15 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
           productId: targetProduct.code,
           product: targetProduct,
           region,
+          ...(locationOptions?.inventorySyncMode
+            ? { inventorySyncMode: locationOptions.inventorySyncMode }
+            : {}),
+          ...(locationOptions?.targetLocationId !== undefined
+            ? { targetLocationId: locationOptions.targetLocationId }
+            : {}),
+          ...(locationOptions?.splitLocationIds !== undefined
+            ? { splitLocationIds: locationOptions.splitLocationIds }
+            : {}),
         }),
       });
 

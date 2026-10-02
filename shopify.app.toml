@@ -2,7 +2,7 @@
 
 client_id = "9f79e1ab580c4a996ca2e6b6b3f62ddb"
 name = "TRENDS API"
-application_url = "https://trends-api-mu.vercel.app"
+application_url = "https://trends-api-mu.vercel.app/app"
 embedded = true
 
 [build]

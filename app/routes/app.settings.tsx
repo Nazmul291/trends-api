@@ -31,9 +31,30 @@ const REGION_META: Record<Region, { flag: string; label: string; currency: strin
 // ---------------------------------------------------------------------------
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
+  const { session, admin } = await authenticate.admin(request);
   const shop = session.shop;
   const settings = await getAppSettings(shop);
+
+  // Fetch live Shopify store locations
+  let locations: Array<{ id: string; name: string; isPrimary: boolean }> = [];
+  try {
+    const locRes = await admin.graphql(
+      `#graphql
+      query getLocations {
+        locations(first: 20, includeInactive: false) {
+          nodes {
+            id
+            name
+            isPrimary
+          }
+        }
+      }`
+    );
+    const locJson = await locRes.json();
+    locations = locJson?.data?.locations?.nodes || [];
+  } catch (err) {
+    console.warn("[Settings] Failed to fetch Shopify locations:", err);
+  }
 
   // Ensure background scheduler is initialized if auto-sync is enabled
   let schedulerStatus = getSchedulerStatus(shop);
@@ -41,6 +62,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     scheduleShopSync(shop, settings);
     schedulerStatus = getSchedulerStatus(shop);
   }
+
+  const primaryLocId = locations.find((l) => l.isPrimary)?.id || locations[0]?.id || "";
 
   return {
     shop,
@@ -52,6 +75,15 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     syncTime: settings.syncTime,
     syncBatchSize: settings.syncBatchSize,
     syncScope: settings.syncScope,
+    inventorySyncMode: settings.inventorySyncMode || "single",
+    targetLocationId: settings.targetLocationId || primaryLocId,
+    splitLocationIds:
+      settings.splitLocationIds && settings.splitLocationIds.length > 0
+        ? settings.splitLocationIds
+        : locations.length >= 2
+        ? locations.slice(0, 2).map((l) => l.id)
+        : [],
+    locations,
     lastSyncedAt: settings.lastSyncedAt ? new Date(settings.lastSyncedAt).toISOString() : null,
     syncStatus: settings.syncStatus,
     syncErrorMessage: settings.syncErrorMessage,
@@ -122,6 +154,36 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   if (formData.get("syncScope_price") === "on") syncScope.push("price");
   if (syncScope.length === 0) syncScope.push("inventory");
 
+  // Inventory Location Strategy
+  const rawMode = formData.get("inventorySyncMode");
+  const inventorySyncMode = rawMode === "split_equal" ? "split_equal" : "single";
+  const targetLocationId = formData.get("targetLocationId")
+    ? String(formData.get("targetLocationId")).trim()
+    : null;
+  const splitLocationIds = formData
+    .getAll("splitLocationIds")
+    .map(String)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  // Form validation per requirement:
+  // "Prevent saving if Single Mode has no location selected, or if Split Mode has fewer than 2 locations checked."
+  if (inventorySyncMode === "single" && !targetLocationId) {
+    return {
+      success: false,
+      actionType: "saveSettings",
+      error: "Please select a target Shopify location for Single Location mode.",
+    };
+  }
+
+  if (inventorySyncMode === "split_equal" && splitLocationIds.length < 2) {
+    return {
+      success: false,
+      actionType: "saveSettings",
+      error: "Please select at least 2 Shopify locations to use Equal Split mode.",
+    };
+  }
+
   try {
     const saved = await saveAppSettings(shop, {
       trendsApiKey,
@@ -132,6 +194,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       syncTime,
       syncBatchSize,
       syncScope,
+      inventorySyncMode,
+      targetLocationId,
+      splitLocationIds,
     });
 
     // Dynamically reschedule background runner
@@ -167,6 +232,10 @@ export default function SettingsPage() {
     syncTime: initialSyncTime,
     syncBatchSize: initialBatchSize,
     syncScope: initialSyncScope,
+    inventorySyncMode: initialInventoryMode,
+    targetLocationId: initialTargetLocation,
+    splitLocationIds: initialSplitLocations,
+    locations = [],
     lastSyncedAt,
     syncStatus,
     syncErrorMessage,
@@ -191,6 +260,13 @@ export default function SettingsPage() {
   const [scopeInventory, setScopeInventory] = useState(initialSyncScope.includes("inventory"));
   const [scopePrice, setScopePrice] = useState(initialSyncScope.includes("price"));
 
+  // Inventory distribution state
+  const [inventoryMode, setInventoryMode] = useState<"single" | "split_equal">(
+    initialInventoryMode || "single"
+  );
+  const [targetLocation, setTargetLocation] = useState<string>(initialTargetLocation || "");
+  const [splitLocations, setSplitLocations] = useState<string[]>(initialSplitLocations || []);
+
   // Persisted state baseline for tracking unsaved modifications
   const [persistedState, setPersistedState] = useState(() => ({
     apiKey: trendsApiKey ?? "",
@@ -202,6 +278,9 @@ export default function SettingsPage() {
     batchSize: initialBatchSize || 50,
     scopeInventory: initialSyncScope.includes("inventory"),
     scopePrice: initialSyncScope.includes("price"),
+    inventoryMode: initialInventoryMode || "single",
+    targetLocation: initialTargetLocation || "",
+    splitLocations: [...(initialSplitLocations || [])].sort(),
   }));
 
   // Re-synchronize baseline whenever fresh loader data is loaded
@@ -216,6 +295,9 @@ export default function SettingsPage() {
       batchSize: initialBatchSize || 50,
       scopeInventory: initialSyncScope.includes("inventory"),
       scopePrice: initialSyncScope.includes("price"),
+      inventoryMode: initialInventoryMode || "single",
+      targetLocation: initialTargetLocation || "",
+      splitLocations: [...(initialSplitLocations || [])].sort(),
     });
   }, [
     trendsApiKey,
@@ -226,6 +308,9 @@ export default function SettingsPage() {
     initialSyncTime,
     initialBatchSize,
     initialSyncScope,
+    initialInventoryMode,
+    initialTargetLocation,
+    initialSplitLocations,
   ]);
 
   const hasSaved = actionData?.success === true && actionData?.actionType === "saveSettings";
@@ -246,6 +331,9 @@ export default function SettingsPage() {
         batchSize,
         scopeInventory,
         scopePrice,
+        inventoryMode,
+        targetLocation,
+        splitLocations: [...splitLocations].sort(),
       });
     }
   }, [hasSaved]);
@@ -260,12 +348,21 @@ export default function SettingsPage() {
     if (batchSize !== persistedState.batchSize) return true;
     if (scopeInventory !== persistedState.scopeInventory) return true;
     if (scopePrice !== persistedState.scopePrice) return true;
+    if (inventoryMode !== persistedState.inventoryMode) return true;
+    if (targetLocation !== persistedState.targetLocation) return true;
 
     // Compare active regions list
     const currentSorted = [...activeRegions].sort();
     if (currentSorted.length !== persistedState.activeRegions.length) return true;
     for (let i = 0; i < currentSorted.length; i++) {
       if (currentSorted[i] !== persistedState.activeRegions[i]) return true;
+    }
+
+    // Compare split locations list
+    const currentSplitSorted = [...splitLocations].sort();
+    if (currentSplitSorted.length !== persistedState.splitLocations.length) return true;
+    for (let i = 0; i < currentSplitSorted.length; i++) {
+      if (currentSplitSorted[i] !== persistedState.splitLocations[i]) return true;
     }
 
     return false;
@@ -279,6 +376,9 @@ export default function SettingsPage() {
     batchSize,
     scopeInventory,
     scopePrice,
+    inventoryMode,
+    targetLocation,
+    splitLocations,
     persistedState,
   ]);
 
@@ -293,6 +393,9 @@ export default function SettingsPage() {
     setBatchSize(persistedState.batchSize);
     setScopeInventory(persistedState.scopeInventory);
     setScopePrice(persistedState.scopePrice);
+    setInventoryMode(persistedState.inventoryMode);
+    setTargetLocation(persistedState.targetLocation);
+    setSplitLocations([...persistedState.splitLocations]);
   };
 
   const toggleRegion = (region: Region) => {
@@ -303,9 +406,26 @@ export default function SettingsPage() {
     });
   };
 
+  const toggleSplitLocation = (locId: string) => {
+    setSplitLocations((prev) => {
+      if (prev.includes(locId)) {
+        return prev.filter((id) => id !== locId);
+      } else {
+        return [...prev, locId];
+      }
+    });
+  };
+
   // Preview generated cron expression
   const previewCron = buildCronExpression(frequency, syncTime);
-  const isSaveDisabled = !isDirty || isSubmitting;
+
+  // Validation: Single mode must have a target location; Split mode must have >= 2 locations
+  const isLocationValid =
+    inventoryMode === "single"
+      ? Boolean(targetLocation && targetLocation.trim().length > 0)
+      : splitLocations.length >= 2;
+
+  const isSaveDisabled = !isDirty || isSubmitting || !isLocationValid;
 
   // Format last synced timestamp
   const formattedLastSync = lastSyncedAt
@@ -925,6 +1045,397 @@ export default function SettingsPage() {
           </div>
 
           {/* ----------------------------------------------------------------- */}
+          {/* SECTION: Inventory Location Strategy                              */}
+          {/* ----------------------------------------------------------------- */}
+          <section
+            style={{
+              borderTop: "1px solid #e1e3e5",
+              paddingTop: "24px",
+              marginBottom: "24px",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "flex-start",
+                marginBottom: "16px",
+                flexWrap: "wrap",
+                gap: "8px",
+              }}
+            >
+              <div>
+                <h2
+                  style={{
+                    margin: "0 0 6px 0",
+                    fontSize: "15px",
+                    fontWeight: 700,
+                    color: "#202223",
+                  }}
+                >
+                  Inventory Location Strategy
+                </h2>
+                <p style={{ margin: 0, fontSize: "13px", color: "#6d7175" }}>
+                  Configure how Trends API warehouse inventory stock is routed across your Shopify locations during synchronization.
+                </p>
+              </div>
+              <span
+                style={{
+                  fontSize: "11px",
+                  fontWeight: 700,
+                  textTransform: "uppercase",
+                  letterSpacing: "0.5px",
+                  padding: "3px 8px",
+                  borderRadius: "12px",
+                  backgroundColor: inventoryMode === "single" ? "#e0f2fe" : "#f0fdf4",
+                  color: inventoryMode === "single" ? "#0369a1" : "#15803d",
+                  border: `1px solid ${inventoryMode === "single" ? "#bae6fd" : "#bbf7d0"}`,
+                }}
+              >
+                {inventoryMode === "single"
+                  ? "Single Location"
+                  : `Equal Split (${splitLocations.length} locations)`}
+              </span>
+            </div>
+
+            {/* Mode Selection Cards */}
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
+                gap: "12px",
+                marginBottom: "20px",
+              }}
+            >
+              {/* Option 1: Single Location */}
+              <div
+                onClick={() => setInventoryMode("single")}
+                style={{
+                  padding: "14px 16px",
+                  borderRadius: "8px",
+                  border: `2px solid ${inventoryMode === "single" ? "#008060" : "#e1e3e5"}`,
+                  backgroundColor: inventoryMode === "single" ? "#f3fdf7" : "#ffffff",
+                  cursor: "pointer",
+                  transition: "all 0.15s ease",
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: "12px",
+                }}
+              >
+                <input
+                  type="radio"
+                  name="inventory_mode_choice"
+                  checked={inventoryMode === "single"}
+                  onChange={() => setInventoryMode("single")}
+                  style={{ marginTop: "3px", accentColor: "#008060" }}
+                />
+                <div>
+                  <div style={{ fontSize: "14px", fontWeight: 600, color: "#202223" }}>
+                    Single Location Mode
+                  </div>
+                  <p style={{ margin: "4px 0 0 0", fontSize: "12px", color: "#6d7175", lineHeight: "1.4" }}>
+                    100% of variant stock quantity is assigned directly to one selected Shopify location.
+                  </p>
+                </div>
+              </div>
+
+              {/* Option 2: Split Equally */}
+              <div
+                onClick={() => setInventoryMode("split_equal")}
+                style={{
+                  padding: "14px 16px",
+                  borderRadius: "8px",
+                  border: `2px solid ${inventoryMode === "split_equal" ? "#008060" : "#e1e3e5"}`,
+                  backgroundColor: inventoryMode === "split_equal" ? "#f3fdf7" : "#ffffff",
+                  cursor: "pointer",
+                  transition: "all 0.15s ease",
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: "12px",
+                }}
+              >
+                <input
+                  type="radio"
+                  name="inventory_mode_choice"
+                  checked={inventoryMode === "split_equal"}
+                  onChange={() => setInventoryMode("split_equal")}
+                  style={{ marginTop: "3px", accentColor: "#008060" }}
+                />
+                <div>
+                  <div style={{ fontSize: "14px", fontWeight: 600, color: "#202223" }}>
+                    Split Equally Across Locations
+                  </div>
+                  <p style={{ margin: "4px 0 0 0", fontSize: "12px", color: "#6d7175", lineHeight: "1.4" }}>
+                    Total stock is divided equally among chosen locations with zero unit loss (remainder allocated first).
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Mode 1 Configuration: Single Location Dropdown */}
+            {inventoryMode === "single" && (
+              <div
+                style={{
+                  padding: "16px",
+                  backgroundColor: "#f9fafb",
+                  borderRadius: "8px",
+                  border: "1px solid #e1e3e5",
+                }}
+              >
+                <label
+                  htmlFor="targetLocationSelect"
+                  style={{
+                    display: "block",
+                    fontSize: "13px",
+                    fontWeight: 600,
+                    color: "#202223",
+                    marginBottom: "8px",
+                  }}
+                >
+                  Target Shopify Location
+                </label>
+                {locations.length > 0 ? (
+                  <select
+                    id="targetLocationSelect"
+                    value={targetLocation}
+                    onChange={(e) => setTargetLocation(e.target.value)}
+                    style={{
+                      width: "100%",
+                      maxWidth: "400px",
+                      padding: "8px 12px",
+                      borderRadius: "6px",
+                      border: "1px solid #c9cccf",
+                      fontSize: "14px",
+                      backgroundColor: "#ffffff",
+                      outline: "none",
+                      color: "#202223",
+                    }}
+                  >
+                    <option value="" disabled>
+                      -- Select Target Location --
+                    </option>
+                    {locations.map((loc) => (
+                      <option key={loc.id} value={loc.id}>
+                        {loc.name} {loc.isPrimary ? "(Primary Fulfillment Location)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <div
+                    style={{
+                      padding: "8px 12px",
+                      backgroundColor: "#fffbeb",
+                      border: "1px solid #fef3c7",
+                      borderRadius: "6px",
+                      color: "#b45309",
+                      fontSize: "12px",
+                    }}
+                  >
+                    No active Shopify locations discovered. Please check your Shopify Admin location settings.
+                  </div>
+                )}
+                <p style={{ margin: "8px 0 0 0", fontSize: "12px", color: "#6d7175" }}>
+                  All incoming stock updates from Trends will be assigned to this location exclusively.
+                </p>
+              </div>
+            )}
+
+            {/* Mode 2 Configuration: Split Equally Multi-Select Checkboxes */}
+            {inventoryMode === "split_equal" && (
+              <div
+                style={{
+                  padding: "16px",
+                  backgroundColor: "#f9fafb",
+                  borderRadius: "8px",
+                  border: "1px solid #e1e3e5",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    marginBottom: "12px",
+                    flexWrap: "wrap",
+                    gap: "8px",
+                  }}
+                >
+                  <div>
+                    <label style={{ fontSize: "13px", fontWeight: 600, color: "#202223" }}>
+                      Select Active Locations for Equal Split
+                    </label>
+                    <p style={{ margin: "2px 0 0 0", fontSize: "12px", color: "#6d7175" }}>
+                      Check at least 2 locations that should participate in equal stock distribution.
+                    </p>
+                  </div>
+                  <div style={{ display: "flex", gap: "8px" }}>
+                    <button
+                      type="button"
+                      onClick={() => setSplitLocations(locations.map((l) => l.id))}
+                      style={{
+                        padding: "4px 10px",
+                        fontSize: "12px",
+                        fontWeight: 600,
+                        color: "#008060",
+                        backgroundColor: "#ffffff",
+                        border: "1px solid #c9cccf",
+                        borderRadius: "6px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Select All
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSplitLocations([])}
+                      style={{
+                        padding: "4px 10px",
+                        fontSize: "12px",
+                        fontWeight: 600,
+                        color: "#6d7175",
+                        backgroundColor: "#ffffff",
+                        border: "1px solid #c9cccf",
+                        borderRadius: "6px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Clear All
+                    </button>
+                  </div>
+                </div>
+
+                {/* Validation message if < 2 locations */}
+                {splitLocations.length < 2 && (
+                  <div
+                    style={{
+                      padding: "8px 12px",
+                      backgroundColor: "#fffbeb",
+                      border: "1px solid #fef3c7",
+                      borderRadius: "6px",
+                      color: "#b45309",
+                      fontSize: "12px",
+                      fontWeight: 600,
+                      marginBottom: "12px",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "6px",
+                    }}
+                  >
+                    <span>⚠️</span>
+                    <span>
+                      Please select at least 2 locations to enable Equal Split mode (currently{" "}
+                      {splitLocations.length} selected).
+                    </span>
+                  </div>
+                )}
+
+                {/* Location Checkboxes List */}
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
+                    gap: "10px",
+                    marginBottom: "16px",
+                  }}
+                >
+                  {locations.map((loc) => {
+                    const isChecked = splitLocations.includes(loc.id);
+                    return (
+                      <label
+                        key={loc.id}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "10px",
+                          padding: "10px 14px",
+                          backgroundColor: isChecked ? "#f0fdf4" : "#ffffff",
+                          border: `1px solid ${isChecked ? "#86efac" : "#e1e3e5"}`,
+                          borderRadius: "6px",
+                          cursor: "pointer",
+                          transition: "all 0.15s ease",
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          onChange={() => toggleSplitLocation(loc.id)}
+                          style={{ accentColor: "#008060", width: "16px", height: "16px" }}
+                        />
+                        <div style={{ flex: 1 }}>
+                          <span style={{ fontSize: "13px", fontWeight: 600, color: "#202223" }}>
+                            {loc.name}
+                          </span>
+                          {loc.isPrimary && (
+                            <span
+                              style={{
+                                marginLeft: "6px",
+                                fontSize: "10px",
+                                fontWeight: 700,
+                                color: "#008060",
+                                backgroundColor: "#e6f4ea",
+                                padding: "1px 5px",
+                                borderRadius: "4px",
+                              }}
+                            >
+                              PRIMARY
+                            </span>
+                          )}
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+
+                {/* Live Math Calculation Preview Card */}
+                {splitLocations.length >= 2 && (
+                  <div
+                    style={{
+                      padding: "12px 14px",
+                      backgroundColor: "#f4f6f8",
+                      borderRadius: "6px",
+                      border: "1px solid #d2d5d8",
+                      fontSize: "12px",
+                      color: "#4a4d50",
+                    }}
+                  >
+                    <div style={{ fontWeight: 600, color: "#202223", marginBottom: "4px" }}>
+                      📊 Mathematical Distribution Preview (Example with 10 units):
+                    </div>
+                    <div>
+                      {(() => {
+                        const count = splitLocations.length;
+                        const baseQty = Math.floor(10 / count);
+                        const remainder = 10 % count;
+                        const selectedLocNames = splitLocations
+                          .map((id) => locations.find((l) => l.id === id)?.name || id)
+                          .map(
+                            (name, i) => `${name}: ${i < remainder ? baseQty + 1 : baseQty} units`
+                          );
+                        return (
+                          <span>
+                            Formula: <code>Math.floor(10 / {count}) = {baseQty}</code> with{" "}
+                            <code>10 % {count} = {remainder}</code> remainder.
+                            <br />
+                            <strong>Allocation:</strong> {selectedLocNames.join(" · ")} (Total: 10 units
+                            preserved, zero units lost).
+                          </span>
+                        );
+                      })()}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Hidden fields for form submission */}
+            <input type="hidden" name="inventorySyncMode" value={inventoryMode} />
+            <input type="hidden" name="targetLocationId" value={targetLocation} />
+            {splitLocations.map((id) => (
+              <input key={id} type="hidden" name="splitLocationIds" value={id} />
+            ))}
+          </section>
+
+          {/* ----------------------------------------------------------------- */}
           {/* SECTION 2: API Credentials Card                                  */}
           {/* ----------------------------------------------------------------- */}
           <section
@@ -1241,6 +1752,29 @@ export default function SettingsPage() {
                   }}
                 />
                 Unsaved changes
+              </span>
+            )}
+
+            {/* Location validation warning badge */}
+            {isDirty && !isLocationValid && (
+              <span
+                style={{
+                  fontSize: "12px",
+                  color: "#b91c1c",
+                  backgroundColor: "#fef2f2",
+                  border: "1px solid #fecaca",
+                  padding: "4px 10px",
+                  borderRadius: "12px",
+                  fontWeight: 600,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "6px",
+                }}
+              >
+                <span>⚠️</span>
+                {inventoryMode === "single"
+                  ? "Select a location for Single Mode"
+                  : "Select at least 2 locations for Split Mode"}
               </span>
             )}
 

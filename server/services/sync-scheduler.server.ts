@@ -11,7 +11,14 @@ import prisma from "../../app/db.server";
 import { unauthenticated } from "../../app/shopify.server";
 import { getAppSettings, saveAppSettings, type AppSettingsData } from "../settings/app-settings.service";
 import { TrendsApiClient } from "../api-client/trends-client";
-import { syncInventoryQuantities, type LocationNode } from "./shopify-sync.service";
+import {
+  syncInventoryQuantities,
+  fetchStoreFulfillmentLocation,
+  parseTrendsStockResponse,
+  allocateStockAcrossLocations,
+  type LocationNode,
+  type InventorySyncItem,
+} from "./shopify-sync.service";
 import { buildCronExpression } from "../../shared/utils/cron";
 import type { Region, StockItemData } from "../../shared/types/trends.types";
 
@@ -180,51 +187,134 @@ export async function runShopifyBackgroundSync(
       // Resolve warehouse fulfillment location if syncing inventory
       let locationId: string | null = null;
       if (syncScope.includes("inventory")) {
-        try {
-          const locRes = await adminClient.graphql(`#graphql
-            query getLocations {
-              locations(first: 10) {
-                nodes {
-                  id
-                  name
-                  isActive
-                }
-              }
-            }
-          `);
-          const locJson = await locRes.json();
-          const nodes: LocationNode[] = locJson.data?.locations?.nodes || [];
-          locationId = nodes.find((l) => l.isActive)?.id || nodes[0]?.id || null;
-        } catch (locErr) {
-          console.warn("[SyncScheduler] Failed to query Shopify locations:", locErr);
+        locationId = await fetchStoreFulfillmentLocation(adminClient, region, shop);
+        if (!locationId) {
+          console.warn(
+            `[SyncScheduler] Warning: Unable to resolve active fulfillment location for ${shop} (${region}). Inventory updates may be skipped.`
+          );
         }
       }
 
       for (const record of syncedRecords) {
         try {
           // A. Stock / Inventory Sync
-          if (syncScope.includes("inventory") && locationId && record.variants.length > 0) {
+          if (syncScope.includes("inventory") && locationId && record.shopifyProductId) {
             const stockRes = await TrendsApiClient.request<any>(
               (record.region as Region) || region,
               `stock/${record.trendsCode}`,
               { settings }
             );
 
-            const stockList: StockItemData[] = Array.isArray(stockRes.data)
-              ? stockRes.data
-              : (stockRes.data as any)?.data || [];
+            const stockList = parseTrendsStockResponse(stockRes?.data);
 
-            if (stockList.length > 0) {
-              const syncItems = record.variants.map((v) => {
-                const matched = stockList.find(
-                  (s) => String(s.stock_code || "").trim() === String(v.stockCode || "").trim()
+            // Resolve real Shopify inventoryItem.id for this product's variants
+            let variantNodes: Array<{
+              id: string;
+              sku: string;
+              inventoryItem?: { id: string; tracked?: boolean };
+            }> = [];
+
+            const needsShopifyLookup = record.variants.some((v) => !v.inventoryItemId);
+
+            if (needsShopifyLookup && !record.shopifyProductId.includes("mock")) {
+              try {
+                const varRes = await adminClient.graphql(
+                  `#graphql
+                  query getProductVariantInventoryItems($id: ID!) {
+                    product(id: $id) {
+                      variants(first: 50) {
+                        nodes {
+                          id
+                          sku
+                          inventoryItem {
+                            id
+                            tracked
+                          }
+                        }
+                      }
+                    }
+                  }`,
+                  { variables: { id: record.shopifyProductId } }
                 );
-                return {
-                  inventoryItemId: v.shopifyVariantId,
-                  quantity: matched ? (typeof matched.quantity === "number" ? matched.quantity : Number(matched.quantity) || 0) : 0,
-                };
-              });
+                const varJson = await varRes.json();
+                variantNodes = varJson?.data?.product?.variants?.nodes || [];
+              } catch (varQueryErr) {
+                console.warn(
+                  `[SyncScheduler] Could not query Shopify variant inventory items for ${record.shopifyProductId}:`,
+                  varQueryErr
+                );
+              }
+            }
 
+            const syncItems: InventorySyncItem[] = [];
+
+            const effectiveMode: "single" | "split_equal" =
+              (record.inventorySyncMode as "single" | "split_equal" | null) ||
+              settings.inventorySyncMode ||
+              "single";
+            const effectiveTargetLocationId: string | null =
+              record.targetLocationId !== undefined && record.targetLocationId !== null
+                ? record.targetLocationId
+                : settings.targetLocationId || null;
+            const effectiveSplitLocationIds: string[] =
+              record.splitLocationIds && record.splitLocationIds.length > 0
+                ? record.splitLocationIds
+                : settings.splitLocationIds || [];
+
+            for (const v of record.variants) {
+              const matchedNode = variantNodes.find(
+                (n) => n.id === v.shopifyVariantId || (n.sku && n.sku.includes(v.stockCode))
+              );
+              const resolvedInventoryItemId = v.inventoryItemId || matchedNode?.inventoryItem?.id;
+
+              // Find matched stock count from Trends API response
+              const matchedStock = stockList.find(
+                (s) =>
+                  s.stockCode.toLowerCase() === v.stockCode.toLowerCase() ||
+                  (matchedNode?.sku && matchedNode.sku.toLowerCase().includes(s.stockCode.toLowerCase()))
+              );
+
+              const qty = matchedStock ? matchedStock.quantity : 0;
+              const sku = matchedNode?.sku || v.stockCode;
+
+              console.info(`[Sync Logger] Variant SKU: ${sku}, Extracted Stock: ${qty}`);
+
+              if (resolvedInventoryItemId) {
+                const allocations = allocateStockAcrossLocations(
+                  qty,
+                  effectiveMode,
+                  effectiveTargetLocationId,
+                  effectiveSplitLocationIds,
+                  locationId
+                );
+
+                for (const alloc of allocations) {
+                  syncItems.push({
+                    inventoryItemId: resolvedInventoryItemId,
+                    quantity: alloc.quantity,
+                    locationId: alloc.locationId,
+                    sku,
+                  });
+                }
+
+                // Update DB with resolved inventoryItemId and lastStockQty
+                await prisma.trendVariantSync
+                  .update({
+                    where: { id: v.id },
+                    data: {
+                      inventoryItemId: resolvedInventoryItemId,
+                      lastStockQty: qty,
+                    },
+                  })
+                  .catch(() => {});
+              } else {
+                console.warn(
+                  `[SyncScheduler] Skipping variant ${v.stockCode}: No valid inventoryItemId found (Variant ID: ${v.shopifyVariantId})`
+                );
+              }
+            }
+
+            if (syncItems.length > 0) {
               await syncInventoryQuantities(adminClient, locationId, syncItems);
             }
           }

@@ -297,6 +297,10 @@ export interface ListOrdersQuery {
   ponum?: string;
 }
 
+/**
+ * @deprecated The Trends API v1 specification is read-only and does not support POST /orders.
+ * Retained temporarily only for backwards compatibility with any legacy mock references.
+ */
 export interface CreateOrderPayload {
   purchase_order_number: string;
   contact_email: string;
