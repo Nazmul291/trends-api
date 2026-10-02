@@ -516,8 +516,9 @@ export async function publishProductToAllChannels(
       mutation publishProductToAllChannels($id: ID!, $input: [PublicationInput!]!) {
         publishablePublish(id: $id, input: $input) {
           publishable {
-            availablePublicationCount
-            publicationCount
+            ... on Product {
+              id
+            }
           }
           userErrors {
             field
@@ -542,16 +543,17 @@ export async function publishProductToAllChannels(
       );
       return {
         success: true,
-        publishedCount: res.data?.publishablePublish?.publishable?.publicationCount || 0,
+        publishedCount: 0,
         errors: errorMsgs,
       };
     }
 
+    const publishedProduct = res.data?.publishablePublish?.publishable;
     console.info(
       `[Shopify Sync] Product ${shopifyProductId} successfully published across ${publicationIds.length} sales channels.`
     );
     return {
-      success: true,
+      success: Boolean(publishedProduct?.id || !userErrors.length),
       publishedCount: publicationIds.length,
     };
   } catch (pubErr: unknown) {
