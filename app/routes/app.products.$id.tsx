@@ -399,17 +399,18 @@ export default function ProductDetailPage() {
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: "1fr 1fr",
+          gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)",
           gap: "36px",
           backgroundColor: "#ffffff",
           borderRadius: "16px",
           border: "1px solid #e1e3e5",
           padding: "32px",
           boxShadow: "0 1px 3px rgba(0,0,0,0.04)",
+          minWidth: 0,
         }}
       >
         {/* Left Column: Image Gallery */}
-        <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: "16px", minWidth: 0, width: "100%", maxWidth: "100%", overflow: "hidden" }}>
           <div
             style={{
               width: "100%",
@@ -464,12 +465,14 @@ export default function ProductDetailPage() {
             )}
           </div>
 
-          <ThumbnailCarousel
-            images={images}
-            activeImageIndex={activeImageIndex}
-            onSelectImage={setActiveImageIndex}
-            productName={product.name}
-          />
+          <div style={{ width: "100%", maxWidth: "100%", minWidth: 0, overflow: "hidden" }}>
+            <ThumbnailCarousel
+              images={images}
+              activeImageIndex={activeImageIndex}
+              onSelectImage={setActiveImageIndex}
+              productName={product.name}
+            />
+          </div>
         </div>
 
         {/* Right Column: Product Attributes & Pricing */}
