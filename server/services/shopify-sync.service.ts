@@ -738,8 +738,8 @@ export async function syncInventoryQuantities(
   try {
     const setRes = await admin.graphql(
       `#graphql
-      mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
-        inventorySetQuantities(input: $input) {
+      mutation inventorySetQuantities($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
+        inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
           inventoryAdjustmentGroup {
             changes {
               name
@@ -760,6 +760,7 @@ export async function syncInventoryQuantities(
             reason: "correction",
             quantities: quantitiesInput,
           },
+          idempotencyKey: randomUUID(),
         },
       }
     );
@@ -823,8 +824,8 @@ export async function syncInventoryQuantities(
 
           const setIndRes = await admin.graphql(
             `#graphql
-            mutation retryIndividualSetQuantity($input: InventorySetQuantitiesInput!) {
-              inventorySetQuantities(input: $input) {
+            mutation retryIndividualSetQuantity($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
+              inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
                 userErrors {
                   field
                   message
@@ -845,6 +846,7 @@ export async function syncInventoryQuantities(
                     },
                   ],
                 },
+                idempotencyKey: randomUUID(),
               },
             }
           );
@@ -854,6 +856,10 @@ export async function syncInventoryQuantities(
             console.warn(
               `[Shopify Sync] retryIndividualSetQuantity error for item ${item.inventoryItemId}:`,
               formatGraphQLErrors(indErrors)
+            );
+          } else {
+            console.info(
+              `[Shopify Sync] Successfully set inventory quantity for item ${item.inventoryItemId} at ${validLocId}`
             );
           }
         } catch (retryErr) {
@@ -919,8 +925,8 @@ export async function syncInventoryQuantities(
 
         const setRes = await admin.graphql(
           `#graphql
-          mutation fallbackIndividualSetQuantity($input: InventorySetQuantitiesInput!) {
-            inventorySetQuantities(input: $input) {
+          mutation fallbackIndividualSetQuantity($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
+            inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
               userErrors {
                 field
                 message
@@ -941,6 +947,7 @@ export async function syncInventoryQuantities(
                   },
                 ],
               },
+              idempotencyKey: randomUUID(),
             },
           }
         );
@@ -950,6 +957,10 @@ export async function syncInventoryQuantities(
           console.warn(
             `[Shopify Sync] fallbackIndividualSetQuantity error for item ${item.inventoryItemId}:`,
             formatGraphQLErrors(setErrors)
+          );
+        } else {
+          console.info(
+            `[Shopify Sync] Successfully set inventory quantity for fallback item ${item.inventoryItemId} at ${validLocId}`
           );
         }
       } catch (indErr) {
