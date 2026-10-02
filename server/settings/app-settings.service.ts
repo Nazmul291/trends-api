@@ -2,7 +2,7 @@
  * App Settings Service
  *
  * Provides DB-backed storage for Trends API configuration (API key, mock fallback flag,
- * and the set of enabled/active regions).
+ * active regions, and background synchronization schedule & parameters).
  * Uses a lightweight in-process TTL cache to avoid a DB query on every request.
  * Gracefully falls back to environment variables when no DB record exists, so existing
  * dev environments continue to work during and after migration.
@@ -14,7 +14,6 @@ import { ALL_REGIONS } from "../../shared/types/trends.types";
 
 export { ALL_REGIONS };
 
-
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -24,6 +23,15 @@ export interface AppSettingsData {
   enableTrendsMockFallback: boolean;
   /** Lower-case region codes that are currently enabled for this shop. */
   enabledRegions: Region[];
+  // Automated Background Sync Configuration
+  autoSyncEnabled: boolean;
+  syncFrequency: string; // "daily" | "every_12_hours" | "hourly" | "custom"
+  syncTime: string; // e.g. "02:00"
+  syncBatchSize: number; // 10 - 100 (default: 50)
+  syncScope: string[]; // ["inventory", "price"]
+  lastSyncedAt: Date | string | null;
+  syncStatus: "idle" | "running" | "failed" | string;
+  syncErrorMessage: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -69,6 +77,18 @@ function normalizeRegions(raw: string[]): Region[] {
   return valid.length > 0 ? valid : ALL_REGIONS;
 }
 
+export function normalizeSyncScope(raw?: string[] | null): string[] {
+  if (!Array.isArray(raw)) return ["inventory", "price"];
+  const valid = raw.filter((s) => ["inventory", "price"].includes(s));
+  return valid.length > 0 ? valid : ["inventory", "price"];
+}
+
+export function normalizeSyncBatchSize(size?: number | string | null): number {
+  const parsed = typeof size === "number" ? size : parseInt(String(size), 10);
+  if (isNaN(parsed)) return 50;
+  return Math.min(100, Math.max(10, parsed));
+}
+
 // ---------------------------------------------------------------------------
 // Environment variable fallback
 // ---------------------------------------------------------------------------
@@ -78,6 +98,14 @@ function getEnvFallback(): AppSettingsData {
     trendsApiKey: process.env.TRENDS_API_KEY || null,
     enableTrendsMockFallback: process.env.ENABLE_TRENDS_MOCK_FALLBACK !== "false",
     enabledRegions: ALL_REGIONS,
+    autoSyncEnabled: true,
+    syncFrequency: "daily",
+    syncTime: "02:00",
+    syncBatchSize: 50,
+    syncScope: ["inventory", "price"],
+    lastSyncedAt: null,
+    syncStatus: "idle",
+    syncErrorMessage: null,
   };
 }
 
@@ -102,6 +130,14 @@ export async function getAppSettings(shop: string): Promise<AppSettingsData> {
         trendsApiKey: record.trendsApiKey || null,
         enableTrendsMockFallback: record.enableTrendsMockFallback,
         enabledRegions: normalizeRegions(record.enabledRegions),
+        autoSyncEnabled: record.autoSyncEnabled,
+        syncFrequency: record.syncFrequency || "daily",
+        syncTime: record.syncTime || "02:00",
+        syncBatchSize: normalizeSyncBatchSize(record.syncBatchSize),
+        syncScope: normalizeSyncScope(record.syncScope),
+        lastSyncedAt: record.lastSyncedAt,
+        syncStatus: record.syncStatus || "idle",
+        syncErrorMessage: record.syncErrorMessage || null,
       };
       setCache(shop, data);
       return data;
@@ -112,7 +148,6 @@ export async function getAppSettings(shop: string): Promise<AppSettingsData> {
 
   // 3. Env variable fallback
   const envData = getEnvFallback();
-  // Cache the fallback briefly too, to prevent hammering the DB during startup
   setCache(shop, envData);
   return envData;
 }
@@ -140,6 +175,14 @@ export async function saveAppSettings(
       trendsApiKey: settings.trendsApiKey ?? null,
       enableTrendsMockFallback: settings.enableTrendsMockFallback ?? true,
       enabledRegions: settings.enabledRegions ?? ALL_REGIONS,
+      autoSyncEnabled: settings.autoSyncEnabled ?? true,
+      syncFrequency: settings.syncFrequency ?? "daily",
+      syncTime: settings.syncTime ?? "02:00",
+      syncBatchSize: settings.syncBatchSize !== undefined ? normalizeSyncBatchSize(settings.syncBatchSize) : 50,
+      syncScope: settings.syncScope !== undefined ? normalizeSyncScope(settings.syncScope) : ["inventory", "price"],
+      lastSyncedAt: settings.lastSyncedAt ?? null,
+      syncStatus: settings.syncStatus ?? "idle",
+      syncErrorMessage: settings.syncErrorMessage ?? null,
     },
     update: {
       ...(settings.trendsApiKey !== undefined && { trendsApiKey: settings.trendsApiKey }),
@@ -147,6 +190,14 @@ export async function saveAppSettings(
         enableTrendsMockFallback: settings.enableTrendsMockFallback,
       }),
       ...(settings.enabledRegions !== undefined && { enabledRegions: settings.enabledRegions }),
+      ...(settings.autoSyncEnabled !== undefined && { autoSyncEnabled: settings.autoSyncEnabled }),
+      ...(settings.syncFrequency !== undefined && { syncFrequency: settings.syncFrequency }),
+      ...(settings.syncTime !== undefined && { syncTime: settings.syncTime }),
+      ...(settings.syncBatchSize !== undefined && { syncBatchSize: normalizeSyncBatchSize(settings.syncBatchSize) }),
+      ...(settings.syncScope !== undefined && { syncScope: normalizeSyncScope(settings.syncScope) }),
+      ...(settings.lastSyncedAt !== undefined && { lastSyncedAt: settings.lastSyncedAt }),
+      ...(settings.syncStatus !== undefined && { syncStatus: settings.syncStatus }),
+      ...(settings.syncErrorMessage !== undefined && { syncErrorMessage: settings.syncErrorMessage }),
     },
   });
 
@@ -154,11 +205,18 @@ export async function saveAppSettings(
     trendsApiKey: record.trendsApiKey || null,
     enableTrendsMockFallback: record.enableTrendsMockFallback,
     enabledRegions: normalizeRegions(record.enabledRegions),
+    autoSyncEnabled: record.autoSyncEnabled,
+    syncFrequency: record.syncFrequency || "daily",
+    syncTime: record.syncTime || "02:00",
+    syncBatchSize: normalizeSyncBatchSize(record.syncBatchSize),
+    syncScope: normalizeSyncScope(record.syncScope),
+    lastSyncedAt: record.lastSyncedAt,
+    syncStatus: record.syncStatus || "idle",
+    syncErrorMessage: record.syncErrorMessage || null,
   };
 
   // Bust cache so next read is fresh
   invalidateSettingsCache(shop);
-  // Pre-populate with the fresh data
   setCache(shop, data);
 
   return data;

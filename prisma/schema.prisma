@@ -86,6 +86,17 @@ model AppSettings {
   trendsApiKey            String?
   enableTrendsMockFallback Boolean  @default(true)
   enabledRegions          String[] @default(["nz", "au", "sg"])
+
+  // Automated Background Sync Configuration
+  autoSyncEnabled         Boolean  @default(true)
+  syncFrequency           String   @default("daily")
+  syncTime                String   @default("02:00")
+  syncBatchSize           Int      @default(50)
+  syncScope               String[] @default(["inventory", "price"])
+  lastSyncedAt            DateTime?
+  syncStatus              String   @default("idle")
+  syncErrorMessage        String?
+
   createdAt               DateTime @default(now())
   updatedAt               DateTime @updatedAt
 }
