@@ -424,6 +424,147 @@ export async function fetchStoreFulfillmentLocation(
   return null;
 }
 
+// In-memory cache for publication channels per shop (TTL: 1 hour)
+interface CachedPublications {
+  publicationIds: string[];
+  timestamp: number;
+}
+const storePublicationsCache = new Map<string, CachedPublications>();
+const PUBLICATIONS_CACHE_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * Automatically queries and caches all active sales channel publications for a store.
+ * Optimizes API consumption by caching channel IDs for the duration of the sync session.
+ */
+export async function fetchStorePublications(
+  admin: { graphql: (query: string, options?: { variables?: Record<string, unknown> }) => Promise<Response> } | undefined,
+  shop: string,
+  options?: { forceRefresh?: boolean }
+): Promise<string[]> {
+  if (!admin) return [];
+
+  const cacheKey = shop || "default";
+  const cached = storePublicationsCache.get(cacheKey);
+  if (!options?.forceRefresh && cached && Date.now() - cached.timestamp < PUBLICATIONS_CACHE_TTL_MS) {
+    return cached.publicationIds;
+  }
+
+  try {
+    const res = await executeShopifyGraphql(
+      admin,
+      `#graphql
+      query getStorePublications {
+        publications(first: 50) {
+          nodes {
+            id
+            name
+            supportsFuturePublishing
+          }
+        }
+      }`
+    );
+
+    const nodes = (res.data?.publications?.nodes || []) as Array<{ id?: string; name?: string }>;
+    const publicationIds = nodes
+      .map((n) => n.id)
+      .filter((id): id is string => typeof id === "string" && id.startsWith("gid://shopify/Publication/"));
+
+    if (publicationIds.length > 0) {
+      storePublicationsCache.set(cacheKey, { publicationIds, timestamp: Date.now() });
+      console.info(`[Shopify Sync] Cached ${publicationIds.length} active sales channel publications for shop ${shop}.`);
+    }
+    return publicationIds;
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (errMsg.includes("Access denied for publications field") || errMsg.includes("read_publications")) {
+      console.info(
+        "[Shopify Sync] Notice: 'read_publications' scope not yet granted in Shopify Admin. Skipping sales channel publication."
+      );
+    } else {
+      console.warn("[Shopify Sync] Could not retrieve publications:", errMsg);
+    }
+    return [];
+  }
+}
+
+/**
+ * Automatically publishes a product to all active sales channel publications via publishablePublish.
+ * Includes defensive error handling so third-party channel rejections never fail product sync.
+ */
+export async function publishProductToAllChannels(
+  admin: { graphql: (query: string, options?: { variables?: Record<string, unknown> }) => Promise<Response> } | undefined,
+  shop: string,
+  shopifyProductId: string | null | undefined
+): Promise<{ success: boolean; publishedCount: number; errors?: string[] }> {
+  if (!admin || !shopifyProductId || shopifyProductId.includes("mock-")) {
+    return { success: true, publishedCount: 0 };
+  }
+
+  try {
+    const publicationIds = await fetchStorePublications(admin, shop);
+    if (!publicationIds || publicationIds.length === 0) {
+      return { success: true, publishedCount: 0 };
+    }
+
+    const input = publicationIds.map((publicationId) => ({
+      publicationId,
+    }));
+
+    const res = await executeShopifyGraphql(
+      admin,
+      `#graphql
+      mutation publishProductToAllChannels($id: ID!, $input: [PublicationInput!]!) {
+        publishablePublish(id: $id, input: $input) {
+          publishable {
+            availablePublicationCount
+            publicationCount
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }`,
+      {
+        variables: {
+          id: shopifyProductId,
+          input,
+        },
+      }
+    );
+
+    const userErrors = res.data?.publishablePublish?.userErrors || [];
+    if (userErrors.length > 0) {
+      const errorMsgs = userErrors.map((e: { message: string; field?: string[] }) => e.message);
+      console.warn(
+        `[Shopify Sync] Notice: Channel publication warning for ${shopifyProductId}:`,
+        errorMsgs.join("; ")
+      );
+      return {
+        success: true,
+        publishedCount: res.data?.publishablePublish?.publishable?.publicationCount || 0,
+        errors: errorMsgs,
+      };
+    }
+
+    console.info(
+      `[Shopify Sync] Product ${shopifyProductId} successfully published across ${publicationIds.length} sales channels.`
+    );
+    return {
+      success: true,
+      publishedCount: publicationIds.length,
+    };
+  } catch (pubErr: unknown) {
+    const errMsg = pubErr instanceof Error ? pubErr.message : String(pubErr);
+    console.warn(`[Shopify Sync] Defensive skip: Channel publication warning for ${shopifyProductId}:`, errMsg);
+    return {
+      success: false,
+      publishedCount: 0,
+      errors: [errMsg],
+    };
+  }
+}
+
 export interface LocationAllocation {
   locationId: string;
   quantity: number;
@@ -1644,6 +1785,7 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
       // --- CREATE NEW PRODUCT ---
       const productInput: Record<string, unknown> = {
         title: trendsProduct.name,
+        status: "ACTIVE", // Set product to ACTIVE by default
         descriptionHtml: buildDescriptionHtml(trendsProduct),
         vendor: "TRENDS Collection",
         productType: trendsProduct.categories?.[0]?.name || "Promotional Product",
@@ -1711,6 +1853,9 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
 
       shopifyProductId = createdProduct.id;
       shopifyHandle = createdProduct.handle;
+
+      // Automatically publish newly created product across all active sales channels
+      await publishProductToAllChannels(admin, shop, shopifyProductId);
 
       // --- CONSTRUCT & SYNC VARIANTS (NEW PRODUCT) ---
       if (normalizedSpecs.length === 1) {
@@ -1908,6 +2053,10 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
         updateInput.descriptionHtml = buildDescriptionHtml(trendsProduct);
       }
 
+      if (!syncLocks.includes("status")) {
+        updateInput.status = "ACTIVE";
+      }
+
       const updateJson = await executeShopifyGraphql(
         admin,
         `#graphql
@@ -1935,6 +2084,9 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
       if (updatedProduct?.handle) {
         shopifyHandle = updatedProduct.handle;
       }
+
+      // Ensure updated product is published across all active sales channels
+      await publishProductToAllChannels(admin, shop, shopifyProductId);
 
       // Synchronize existing variant prices if not locked, AND create any missing variants!
       try {
