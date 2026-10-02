@@ -47,7 +47,7 @@ export function formatDate(dateString?: string | null): string {
   }
 }
 
-export type StockLevel = "in_stock" | "low_stock" | "out_of_stock";
+export type StockLevel = "in_stock" | "low_stock" | "out_of_stock" | "available";
 
 export interface StockStatusInfo {
   level: StockLevel;
@@ -55,24 +55,50 @@ export interface StockStatusInfo {
   tone: "success" | "warning" | "critical" | "info";
 }
 
-export function evaluateStockStatus(quantity: number): StockStatusInfo {
-  if (quantity <= 0) {
+export function evaluateStockStatus(
+  quantity?: number | null,
+  options?: {
+    isUntracked?: boolean;
+    pricingType?: string;
+  }
+): StockStatusInfo {
+  if (options?.isUntracked || options?.pricingType?.toLowerCase() === "indent") {
+    return {
+      level: "available",
+      label: "Made to Order",
+      tone: "info",
+    };
+  }
+
+  if (quantity === undefined || quantity === null) {
+    return {
+      level: "available",
+      label: "Check Availability",
+      tone: "info",
+    };
+  }
+
+  const num = typeof quantity === "number" ? quantity : Number(quantity) || 0;
+
+  if (num <= 0) {
     return {
       level: "out_of_stock",
       label: "Out of Stock",
       tone: "critical",
     };
   }
-  if (quantity < 100) {
+
+  if (num < 100) {
     return {
       level: "low_stock",
-      label: `Low Stock (${quantity})`,
+      label: `Low Stock (${num})`,
       tone: "warning",
     };
   }
+
   return {
     level: "in_stock",
-    label: `In Stock (${quantity.toLocaleString()})`,
+    label: `In Stock (${num.toLocaleString()})`,
     tone: "success",
   };
 }

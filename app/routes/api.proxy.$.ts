@@ -1,5 +1,6 @@
 import type { LoaderFunctionArgs, ActionFunctionArgs } from "react-router";
 import type { Region, ApiProxyResponse, ProductData, ProductShowData } from "../../shared/types/trends.types";
+import { normalizePricing } from "../../shared/types/trends.types";
 import { cacheAdapter, CacheKeyBuilder, DEFAULT_CACHE_CONFIG } from "../../server/cache";
 import { TrendsApiClient } from "../../server/api-client/trends-client";
 import {
@@ -9,19 +10,24 @@ import {
 } from "../../server/services/shopify-sync.service";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
+import { getAppSettings } from "../../server/settings/app-settings.service";
 
 /**
  * Helper to parse region and endpoint path from request
  * Accepts /api/proxy/:region/:endpoint or query ?region=:region
  */
-function parseProxyTarget(params: Record<string, string | undefined>, url: URL): {
-  region: Region;
+function parseProxyTarget(
+  params: Record<string, string | undefined>,
+  url: URL,
+  defaultRegion?: Region
+): {
+  region: Region | null;
   endpoint: string;
 } {
   const wildcard = params["*"] || "";
   const segments = wildcard.split("/").filter(Boolean);
 
-  let region: Region = "nz";
+  let region: Region | null = null;
   let endpointSegments = segments;
 
   if (segments.length > 0 && ["nz", "au", "sg"].includes(segments[0].toLowerCase())) {
@@ -32,6 +38,10 @@ function parseProxyTarget(params: Record<string, string | undefined>, url: URL):
     if (queryRegion && ["nz", "au", "sg"].includes(queryRegion.toLowerCase())) {
       region = queryRegion.toLowerCase() as Region;
     }
+  }
+
+  if (!region && defaultRegion) {
+    region = defaultRegion;
   }
 
   const endpoint = endpointSegments.join("/");
@@ -72,8 +82,21 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     }
   }
 
+  // Load DB-backed settings (falls back to env vars if no record exists)
+  const appSettings = await getAppSettings(shop);
+  const enabledRegions = (appSettings.enabledRegions || []) as Region[];
+  const fallbackRegion: Region = enabledRegions[0] || "au";
+
   const url = new URL(request.url);
-  const { region, endpoint } = parseProxyTarget(params, url);
+  const target = parseProxyTarget(params, url, fallbackRegion);
+  const endpoint = target.endpoint;
+  let region: Region = target.region || fallbackRegion;
+
+  // Strictly enforce enabled regions from database settings:
+  // If requested region is missing, invalid, or disabled, reassign dynamically to first enabled region.
+  if (enabledRegions.length > 0 && !enabledRegions.includes(region)) {
+    region = enabledRegions[0];
+  }
 
   if (!endpoint) {
     return Response.json(
@@ -103,6 +126,11 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   queryParams.delete("region");
   queryParams.delete("bypassCache");
 
+  // Default products catalog endpoint to 50 items per batch/page
+  if (endpoint === "products" && !queryParams.has("page_size")) {
+    queryParams.set("page_size", "50");
+  }
+
   const cacheKey = CacheKeyBuilder.custom(region, endpoint, queryParams.toString());
 
   // 1. Check Cache Layer
@@ -131,7 +159,51 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     const upstreamRes = await TrendsApiClient.request<unknown>(region, endpoint, {
       method: "GET",
       params: queryParams,
+      settings: appSettings,
     });
+
+    // If fetching the product catalog list, enrich each product with live/cached stock & normalize pricing
+    if (endpoint === "products" && upstreamRes.data && typeof upstreamRes.data === "object") {
+      const listData = upstreamRes.data as any;
+      if (Array.isArray(listData.data) && listData.data.length > 0) {
+        await Promise.all(
+          listData.data.map(async (prod: any) => {
+            prod.pricing = normalizePricing(prod.pricing);
+            if ((!prod.stock || prod.stock.length === 0) && prod.code) {
+              try {
+                const stockCacheKey = CacheKeyBuilder.stock(region, String(prod.code));
+                const cachedStock = await cacheAdapter.get<any[]>(stockCacheKey);
+                if (cachedStock && Array.isArray(cachedStock)) {
+                  prod.stock = cachedStock;
+                } else {
+                  const stockRes = await TrendsApiClient.request<any>(region, `stock/${prod.code}`, {
+                    settings: appSettings,
+                  });
+                  const items = stockRes?.data?.data || [];
+                  prod.stock = items;
+                  if (items.length > 0) {
+                    await cacheAdapter.set(stockCacheKey, items, DEFAULT_CACHE_CONFIG.stockTtl);
+                  }
+                }
+              } catch {
+                prod.stock = [];
+              }
+            }
+          })
+        );
+      }
+    }
+
+    // If fetching a single product, ensure single-object normalization (upstream returns array)
+    if (endpoint.startsWith("products/") && upstreamRes.data && typeof upstreamRes.data === "object") {
+      const showData = upstreamRes.data as any;
+      if (Array.isArray(showData.data) && showData.data.length > 0) {
+        showData.data = showData.data[0];
+      }
+      if (showData.data && typeof showData.data === "object") {
+        showData.data.pricing = normalizePricing(showData.data.pricing);
+      }
+    }
 
     // 3. Populate Cache
     if (!bypassCache && ttl > 0 && upstreamRes.data) {
@@ -186,8 +258,21 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     }
   }
 
+  // Load DB-backed settings (falls back to env vars if no record exists)
+  const appSettings = await getAppSettings(shop);
+  const enabledRegions = (appSettings.enabledRegions || []) as Region[];
+  const fallbackRegion: Region = enabledRegions[0] || "au";
+
   const url = new URL(request.url);
-  const { region, endpoint } = parseProxyTarget(params, url);
+  const target = parseProxyTarget(params, url, fallbackRegion);
+  const endpoint = target.endpoint;
+  let region: Region = target.region || fallbackRegion;
+
+  // Strictly enforce enabled regions from database settings:
+  // If requested region is missing, invalid, or disabled, reassign dynamically to first enabled region.
+  if (enabledRegions.length > 0 && !enabledRegions.includes(region)) {
+    region = enabledRegions[0];
+  }
 
   if (!endpoint) {
     return Response.json(
@@ -245,12 +330,19 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         trendsProduct?: ProductData;
         syncLocks?: string[];
         isMock?: boolean;
+        inventorySyncMode?: "single" | "split_equal";
+        targetLocationId?: string | null;
+        splitLocationIds?: string[];
       };
 
       let productToSync = body.product || body.trendsProduct;
+      if (Array.isArray(productToSync)) {
+        productToSync = productToSync[0];
+      }
       if (!productToSync && body.productId) {
-        const showRes = await TrendsApiClient.request<ProductShowData>(region, `products/${body.productId}`);
-        productToSync = showRes.data?.data;
+        const showRes = await TrendsApiClient.request<ProductShowData>(region, `products/${body.productId}`, { settings: appSettings });
+        const rawShow = showRes.data?.data;
+        productToSync = Array.isArray(rawShow) ? rawShow[0] : rawShow;
       }
 
       if (!productToSync) {
@@ -267,6 +359,9 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         region,
         syncLocks: body.syncLocks,
         isMock: body.isMock,
+        inventorySyncMode: body.inventorySyncMode,
+        targetLocationId: body.targetLocationId,
+        splitLocationIds: body.splitLocationIds,
       });
 
       return Response.json({
@@ -291,34 +386,26 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     }
   }
 
-  try {
-    const body = await request.json().catch(() => undefined);
-    const upstreamRes = await TrendsApiClient.request<unknown>(region, endpoint, {
-      method: request.method as "POST" | "PUT" | "DELETE",
-      body,
-    });
-
-    const response: ApiProxyResponse<unknown> = {
-      success: true,
-      region,
-      cached: false,
-      timestamp: new Date().toISOString(),
-      data: upstreamRes.data,
-    };
-
-    return Response.json(response, { status: upstreamRes.status });
-  } catch (err: unknown) {
-    const errorObj = err as { status?: number; message?: string; data?: unknown };
+  // Trends API specification (OpenAPI 3.1.0) is strictly read-only (GET).
+  // Block any non-compliant mutations (e.g. POST /orders) to upstream endpoints.
+  if (endpoint.startsWith("orders")) {
     return Response.json(
       {
         success: false,
         region,
-        cached: false,
-        timestamp: new Date().toISOString(),
-        error: errorObj.message || "Upstream mutation failed",
-        details: errorObj.data,
+        error:
+          "The Trends API does not support outbound order creation (POST /orders). Orders must be created via distributor purchasing and tracked via GET /api/v1/orders.",
       },
-      { status: errorObj.status || 500 }
+      { status: 405 }
     );
   }
+
+  return Response.json(
+    {
+      success: false,
+      region,
+      error: `Method ${request.method} is not supported for upstream Trends endpoint '${endpoint}'. Trends API specification is read-only (GET).`,
+    },
+    { status: 405 }
+  );
 };

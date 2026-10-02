@@ -3,7 +3,6 @@ import type {
   OrderData,
   OrderListData,
   ListOrdersQuery,
-  CreateOrderPayload,
   ApiProxyResponse,
 } from "../../shared/types/trends.types";
 import { useRegionStore, type StoreStatus } from "./useRegionStore";
@@ -14,12 +13,9 @@ interface OrderState {
   ordersError: string | null;
 
   activeOrder: OrderData | null;
-  submitStatus: StoreStatus;
-  submitError: string | null;
 
   // Actions
   fetchOrders: (query?: ListOrdersQuery) => Promise<void>;
-  createOrder: (payload: CreateOrderPayload) => Promise<OrderData | null>;
   setActiveOrder: (order: OrderData | null) => void;
   resetOrderState: () => void;
 }
@@ -30,8 +26,6 @@ export const useOrderStore = create<OrderState>((set) => ({
   ordersError: null,
 
   activeOrder: null,
-  submitStatus: "idle",
-  submitError: null,
 
   fetchOrders: async (query = {}) => {
     const region = useRegionStore.getState().currentRegion;
@@ -71,44 +65,6 @@ export const useOrderStore = create<OrderState>((set) => ({
     }
   },
 
-  createOrder: async (payload: CreateOrderPayload): Promise<OrderData | null> => {
-    const region = useRegionStore.getState().currentRegion;
-    set({ submitStatus: "loading", submitError: null });
-
-    try {
-      const res = await fetch(`/api/proxy/${region}/orders`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      });
-
-      if (!res.ok) {
-        const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.error || `Failed to place order (HTTP ${res.status})`);
-      }
-
-      const envelope = (await res.json()) as ApiProxyResponse<OrderData>;
-      const createdOrder = envelope.data;
-
-      set((state) => ({
-        orders: createdOrder ? [createdOrder, ...state.orders] : state.orders,
-        activeOrder: createdOrder || null,
-        submitStatus: "success",
-        submitError: null,
-      }));
-
-      return createdOrder || null;
-    } catch (err: unknown) {
-      set({
-        submitStatus: "error",
-        submitError: (err as Error)?.message || "Order submission failed",
-      });
-      return null;
-    }
-  },
-
   setActiveOrder: (order: OrderData | null) => {
     set({ activeOrder: order });
   },
@@ -119,8 +75,6 @@ export const useOrderStore = create<OrderState>((set) => ({
       ordersStatus: "idle",
       ordersError: null,
       activeOrder: null,
-      submitStatus: "idle",
-      submitError: null,
     });
   },
 }));

@@ -1,7 +1,9 @@
 import React, { useEffect, useState } from "react";
-import type { LoaderFunctionArgs } from "react-router";
-import { useParams, useNavigate } from "react-router";
+import type { LoaderFunctionArgs, ActionFunctionArgs } from "react-router";
+import { useParams, useNavigate, useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
+import prisma from "../db.server";
+import { getAppSettings } from "../../server/settings/app-settings.service";
 import { useProductDetailStore } from "../stores/useProductDetailStore";
 import { useRegionStore } from "../stores/useRegionStore";
 import { StatusBadge } from "../components/atoms/StatusBadge";
@@ -9,17 +11,222 @@ import { PriceTag } from "../components/atoms/PriceTag";
 import { Button } from "../components/atoms/Button";
 import { Skeleton } from "../components/atoms/Skeleton";
 import { StockBadge } from "../components/molecules/StockBadge";
+import { ThumbnailCarousel } from "../components/molecules/ThumbnailCarousel";
 import { LeadTimeIndicator } from "../components/molecules/LeadTimeIndicator";
 import { formatCurrency } from "../../shared/utils/formatters";
+import type { ProductData, StockItemData } from "../../shared/types/trends.types";
+import { normalizePricing } from "../../shared/types/trends.types";
 
-export const loader = async ({ request }: LoaderFunctionArgs) => {
-  await authenticate.admin(request);
+/**
+ * Resolves the unit price for a variant/stock line item.
+ * Checks variant-level fields first, then matched product variants,
+ * then falls back to the product's primary starting tier price.
+ */
+function getVariantPrice(
+  item: StockItemData,
+  product?: ProductData | null
+): number | string | null {
+  const rawItem = item as unknown as Record<string, unknown>;
+
+  // 1. Check direct variant price fields
+  if (rawItem.price !== undefined && rawItem.price !== null && rawItem.price !== "") {
+    return rawItem.price as number | string;
+  }
+  if (rawItem.unit_price !== undefined && rawItem.unit_price !== null && rawItem.unit_price !== "") {
+    return rawItem.unit_price as number | string;
+  }
+  if (rawItem.unitPrice !== undefined && rawItem.unitPrice !== null && rawItem.unitPrice !== "") {
+    return rawItem.unitPrice as number | string;
+  }
+  if (rawItem.wholesale_price !== undefined && rawItem.wholesale_price !== null && rawItem.wholesale_price !== "") {
+    return rawItem.wholesale_price as number | string;
+  }
+
+  // 2. Check matched product variants by stock code / SKU if present
+  const prodAny = product as Record<string, unknown> | null | undefined;
+  if (Array.isArray(prodAny?.variants)) {
+    const matched = prodAny.variants.find(
+      (v: any) =>
+        v.sku === item.stock_code ||
+        v.stock_code === item.stock_code ||
+        v.code === item.stock_code ||
+        String(v.id) === String(item.stock_code)
+    );
+    if (matched?.price !== undefined && matched?.price !== null && matched?.price !== "") {
+      return matched.price;
+    }
+  }
+
+  // 3. Fallback to product primary pricing tier starting price
+  const pricingList = normalizePricing(product?.pricing);
+  if (pricingList.length > 0 && pricingList[0].prices && pricingList[0].prices.length > 0) {
+    const startingPrice = pricingList[0].prices[0].price;
+    if (startingPrice !== undefined && startingPrice !== null && startingPrice !== "") {
+      return startingPrice;
+    }
+  }
+
   return null;
+}
+
+export const loader = async ({ request, params }: LoaderFunctionArgs) => {
+  const { session, admin } = await authenticate.admin(request);
+  const shop = session.shop;
+  const productId = params.id;
+
+  // 1. Fetch live Shopify store locations
+  let locations: Array<{ id: string; name: string; isPrimary: boolean }> = [];
+  try {
+    const locRes = await admin.graphql(
+      `#graphql
+      query getLocations {
+        locations(first: 20, includeInactive: false) {
+          nodes {
+            id
+            name
+            isPrimary
+          }
+        }
+      }`
+    );
+    const locJson = await locRes.json();
+    locations = locJson?.data?.locations?.nodes || [];
+  } catch (err) {
+    console.warn("[ProductDetails] Failed to fetch Shopify locations:", err);
+  }
+
+  // 2. Fetch global app settings
+  const settings = await getAppSettings(shop);
+
+  // 3. Fetch product sync record if already synced or customized
+  let productSync = null;
+  if (productId) {
+    productSync = await prisma.trendProductSync.findFirst({
+      where: {
+        shop,
+        trendsCode: String(productId),
+      },
+      select: {
+        id: true,
+        shopifyProductId: true,
+        inventorySyncMode: true,
+        targetLocationId: true,
+        splitLocationIds: true,
+        lastSyncedAt: true,
+      },
+    });
+  }
+
+  const primaryLocId = locations.find((l) => l.isPrimary)?.id || locations[0]?.id || "";
+
+  return {
+    shop,
+    locations,
+    globalSettings: {
+      inventorySyncMode: settings.inventorySyncMode || "single",
+      targetLocationId: settings.targetLocationId || primaryLocId,
+      splitLocationIds: settings.splitLocationIds || [],
+    },
+    productSync: productSync
+      ? {
+          ...productSync,
+          lastSyncedAt: productSync.lastSyncedAt ? productSync.lastSyncedAt.toISOString() : null,
+        }
+      : null,
+  };
+};
+
+export const action = async ({ request, params }: ActionFunctionArgs) => {
+  const { session } = await authenticate.admin(request);
+  const shop = session.shop;
+  const productId = params.id;
+
+  if (!productId) {
+    return { success: false, error: "Missing product ID" };
+  }
+
+  const formData = await request.formData();
+  const intent = formData.get("intent");
+
+  if (intent === "saveLocationOverride") {
+    const useOverride = formData.get("useOverride") === "true";
+    const inventorySyncMode = useOverride
+      ? (String(formData.get("inventorySyncMode") || "single") as "single" | "split_equal")
+      : null;
+    const targetLocationId = useOverride
+      ? formData.get("targetLocationId")
+        ? String(formData.get("targetLocationId")).trim()
+        : null
+      : null;
+    const splitLocationIds = useOverride
+      ? formData.getAll("splitLocationIds").map(String).map((s) => s.trim()).filter(Boolean)
+      : [];
+
+    if (useOverride) {
+      if (inventorySyncMode === "single" && !targetLocationId) {
+        return { success: false, error: "Please select a target Shopify location for Single Location mode." };
+      }
+      if (inventorySyncMode === "split_equal" && splitLocationIds.length < 2) {
+        return { success: false, error: "Please select at least 2 Shopify locations for Equal Split mode." };
+      }
+    }
+
+    try {
+      const existing = await prisma.trendProductSync.findFirst({
+        where: { shop, trendsCode: String(productId) },
+      });
+
+      if (existing) {
+        await prisma.trendProductSync.update({
+          where: { id: existing.id },
+          data: {
+            inventorySyncMode,
+            targetLocationId,
+            splitLocationIds,
+          },
+        });
+      } else {
+        await prisma.trendProductSync.create({
+          data: {
+            shop,
+            trendsCode: String(productId),
+            shopifyProductId: `pending-sync-${productId}`,
+            region: "au",
+            inventorySyncMode,
+            targetLocationId,
+            splitLocationIds,
+          },
+        });
+      }
+
+      return {
+        success: true,
+        message: useOverride
+          ? "Custom location distribution override saved for this product."
+          : "Product reset to use storewide global location settings.",
+      };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : "Failed to save override." };
+    }
+  }
+
+  return { success: false, error: "Unknown action" };
 };
 
 export default function ProductDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+
+  const loaderData = useLoaderData<typeof loader>();
+  const locations = loaderData?.locations || [];
+  const globalSettings = loaderData?.globalSettings || {
+    inventorySyncMode: "single",
+    targetLocationId: "",
+    splitLocationIds: [],
+  };
+  const productSync = loaderData?.productSync;
+
+  const fetcher = useFetcher<typeof action>();
 
   const currentRegion = useRegionStore((s) => s.currentRegion);
 
@@ -53,6 +260,75 @@ export default function ProductDetailPage() {
 
   const [activeImageIndex, setActiveImageIndex] = useState(0);
   const [detailImageError, setDetailImageError] = useState(false);
+
+  // Determine initial override state
+  const hasExistingOverride = Boolean(
+    productSync?.inventorySyncMode ||
+    productSync?.targetLocationId ||
+    (productSync?.splitLocationIds && productSync.splitLocationIds.length > 0)
+  );
+
+  const [useOverride, setUseOverride] = useState(hasExistingOverride);
+  const [productMode, setProductMode] = useState<"single" | "split_equal">(
+    (productSync?.inventorySyncMode as "single" | "split_equal") ||
+      globalSettings.inventorySyncMode ||
+      "single"
+  );
+  const [productTargetLoc, setProductTargetLoc] = useState<string>(
+    productSync?.targetLocationId || globalSettings.targetLocationId || locations[0]?.id || ""
+  );
+  const [productSplitLocs, setProductSplitLocs] = useState<string[]>(
+    productSync?.splitLocationIds && productSync.splitLocationIds.length > 0
+      ? productSync.splitLocationIds
+      : globalSettings.splitLocationIds && globalSettings.splitLocationIds.length > 0
+      ? globalSettings.splitLocationIds
+      : locations.slice(0, 2).map((l) => l.id)
+  );
+
+  // Sync state if productSync changes
+  useEffect(() => {
+    if (productSync) {
+      const hasOverride = Boolean(
+        productSync.inventorySyncMode ||
+        productSync.targetLocationId ||
+        (productSync.splitLocationIds && productSync.splitLocationIds.length > 0)
+      );
+      setUseOverride(hasOverride);
+      if (productSync.inventorySyncMode) {
+        setProductMode(productSync.inventorySyncMode as "single" | "split_equal");
+      }
+      if (productSync.targetLocationId) {
+        setProductTargetLoc(productSync.targetLocationId);
+      }
+      if (productSync.splitLocationIds && productSync.splitLocationIds.length > 0) {
+        setProductSplitLocs(productSync.splitLocationIds);
+      }
+    }
+  }, [productSync]);
+
+  const handleSyncWithLocationOptions = () => {
+    if (useOverride) {
+      syncProductToShopify(undefined, {
+        inventorySyncMode: productMode,
+        targetLocationId: productTargetLoc,
+        splitLocationIds: productSplitLocs,
+      });
+    } else {
+      syncProductToShopify();
+    }
+  };
+
+  const handleSaveOverride = () => {
+    const formData = new FormData();
+    formData.append("intent", "saveLocationOverride");
+    formData.append("useOverride", useOverride ? "true" : "false");
+    if (useOverride) {
+      formData.append("inventorySyncMode", productMode);
+      formData.append("targetLocationId", productTargetLoc);
+      productSplitLocs.forEach((id: string) => formData.append("splitLocationIds", id));
+    }
+    fetcher.submit(formData, { method: "post" });
+  };
 
   useEffect(() => {
     setDetailImageError(false);
@@ -123,8 +399,22 @@ export default function ProductDetailPage() {
 
   const images = product.images || [];
   const activeImage = images[activeImageIndex]?.link || "https://placehold.co/500x500?text=No+Image";
-  const primaryPricing = product.pricing?.[0];
-  const totalStock = stock.reduce((sum, item) => sum + (item.quantity || 0), 0);
+  const pricingList = normalizePricing(product.pricing);
+  const primaryPricing = pricingList[0];
+  const stockList = Array.isArray(stock) && stock.length > 0 ? stock : Array.isArray(product.stock) ? product.stock : [];
+  const hasStockData = stockList.length > 0;
+  const totalStock = hasStockData
+    ? stockList.reduce((sum, item) => sum + (typeof item.quantity === "number" ? item.quantity : Number(item.quantity) || 0), 0)
+    : 0;
+  const isIndent = Boolean(pricingList.some((p) => p.type?.toLowerCase() === "indent"));
+
+  // Normalize colours: live API may return a string or string[] — always coerce to string[]
+  const productColours: string[] = Array.isArray(product.colours)
+    ? product.colours
+    : typeof product.colours === "string" && (product.colours as string).length > 0
+      ? (product.colours as string).split(",").map((c) => c.trim())
+      : [];
+
 
   const adminNumericId = shopifyNumericId || shopifyProductId?.split("/").pop();
   const shopSubdomain = shopifyShop ? shopifyShop.replace(".myshopify.com", "") : null;
@@ -199,7 +489,7 @@ export default function ProductDetailPage() {
               variant="primary"
               size="sm"
               loading={syncStatus === "loading"}
-              onClick={() => syncProductToShopify()}
+              onClick={handleSyncWithLocationOptions}
               icon={
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
@@ -284,7 +574,7 @@ export default function ProductDetailPage() {
           <Button
             variant="outline"
             size="sm"
-            onClick={() => syncProductToShopify()}
+            onClick={handleSyncWithLocationOptions}
             style={{ color: "#991b1b", borderColor: "#fca5a5" }}
           >
             Retry Sync
@@ -330,17 +620,18 @@ export default function ProductDetailPage() {
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: "1fr 1fr",
+          gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)",
           gap: "36px",
           backgroundColor: "#ffffff",
           borderRadius: "16px",
           border: "1px solid #e1e3e5",
           padding: "32px",
           boxShadow: "0 1px 3px rgba(0,0,0,0.04)",
+          minWidth: 0,
         }}
       >
         {/* Left Column: Image Gallery */}
-        <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: "16px", minWidth: 0, width: "100%", maxWidth: "100%", overflow: "hidden" }}>
           <div
             style={{
               width: "100%",
@@ -395,34 +686,14 @@ export default function ProductDetailPage() {
             )}
           </div>
 
-          {images.length > 1 && (
-            <div style={{ display: "flex", gap: "8px", overflowX: "auto", paddingBottom: "4px" }}>
-              {images.map((img, idx) => (
-                <button
-                  key={idx}
-                  type="button"
-                  onClick={() => setActiveImageIndex(idx)}
-                  style={{
-                    width: "64px",
-                    height: "64px",
-                    borderRadius: "8px",
-                    border: `2px solid ${activeImageIndex === idx ? "#008060" : "#e1e3e5"}`,
-                    backgroundColor: "#f9fafb",
-                    padding: "2px",
-                    cursor: "pointer",
-                    overflow: "hidden",
-                    flexShrink: 0,
-                  }}
-                >
-                  <img
-                    src={img.link}
-                    alt=""
-                    style={{ width: "100%", height: "100%", objectFit: "contain" }}
-                  />
-                </button>
-              ))}
-            </div>
-          )}
+          <div style={{ width: "100%", maxWidth: "100%", minWidth: 0, overflow: "hidden" }}>
+            <ThumbnailCarousel
+              images={images}
+              activeImageIndex={activeImageIndex}
+              onSelectImage={setActiveImageIndex}
+              productName={product.name}
+            />
+          </div>
         </div>
 
         {/* Right Column: Product Attributes & Pricing */}
@@ -490,13 +761,13 @@ export default function ProductDetailPage() {
           )}
 
           {/* Available Colours */}
-          {product.colours && product.colours.length > 0 && (
+          {productColours.length > 0 && (
             <div>
               <span style={{ fontSize: "12px", fontWeight: 600, color: "#202223", display: "block", marginBottom: "6px" }}>
-                Available Colours ({product.colours.length})
+                Available Colours ({productColours.length})
               </span>
               <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
-                {product.colours.map((col, idx) => (
+                {productColours.map((col, idx) => (
                   <span
                     key={idx}
                     style={{
@@ -529,6 +800,429 @@ export default function ProductDetailPage() {
           {/* Lead Times */}
           <LeadTimeIndicator leadTimes={leadTimes} />
         </div>
+      </div>
+
+      {/* Inventory Distribution Settings Card */}
+      <div
+        style={{
+          backgroundColor: "#ffffff",
+          borderRadius: "16px",
+          border: "1px solid #e1e3e5",
+          padding: "24px",
+          boxShadow: "0 1px 3px rgba(0,0,0,0.04)",
+          display: "flex",
+          flexDirection: "column",
+          gap: "16px",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "flex-start",
+            flexWrap: "wrap",
+            gap: "12px",
+          }}
+        >
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <h3 style={{ fontSize: "16px", fontWeight: 700, margin: 0, color: "#202223" }}>
+                Inventory Distribution Settings
+              </h3>
+              <span
+                style={{
+                  fontSize: "11px",
+                  fontWeight: 600,
+                  padding: "2px 8px",
+                  borderRadius: "10px",
+                  backgroundColor: useOverride ? "#fef3c7" : "#f1f2f3",
+                  color: useOverride ? "#92400e" : "#6d7175",
+                  border: `1px solid ${useOverride ? "#fde68a" : "#e1e3e5"}`,
+                }}
+              >
+                {useOverride ? "Product Override Active" : "Using Global Strategy"}
+              </span>
+            </div>
+            <p style={{ margin: "4px 0 0 0", fontSize: "13px", color: "#6d7175" }}>
+              Choose whether to adhere to storewide inventory routing or apply custom location allocation rules for this product.
+            </p>
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+            <Button
+              variant="primary"
+              size="sm"
+              loading={fetcher.state === "submitting"}
+              onClick={handleSaveOverride}
+            >
+              {fetcher.state === "submitting" ? "Saving..." : "Save Location Rules"}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              loading={syncStatus === "loading"}
+              onClick={handleSyncWithLocationOptions}
+            >
+              {syncStatus === "loading" ? "Syncing..." : isSynced ? "🔄 Re-sync Stock" : "Sync to Shopify"}
+            </Button>
+          </div>
+        </div>
+
+        {fetcher.data?.message && (
+          <div
+            style={{
+              padding: "10px 14px",
+              backgroundColor: "#f0fdf4",
+              border: "1px solid #bbf7d0",
+              borderRadius: "8px",
+              color: "#166534",
+              fontSize: "13px",
+              fontWeight: 600,
+            }}
+          >
+            ✓ {fetcher.data.message}
+          </div>
+        )}
+        {fetcher.data?.error && (
+          <div
+            style={{
+              padding: "10px 14px",
+              backgroundColor: "#fef2f2",
+              border: "1px solid #fecaca",
+              borderRadius: "8px",
+              color: "#991b1b",
+              fontSize: "13px",
+              fontWeight: 600,
+            }}
+          >
+            ⚠️ {fetcher.data.error}
+          </div>
+        )}
+
+        {/* Global Strategy Summary Box (when not overriding) */}
+        {!useOverride && (
+          <div
+            style={{
+              padding: "14px 16px",
+              backgroundColor: "#f9fafb",
+              borderRadius: "8px",
+              border: "1px solid #e1e3e5",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              flexWrap: "wrap",
+              gap: "8px",
+            }}
+          >
+            <div>
+              <span style={{ fontSize: "12px", fontWeight: 600, color: "#6d7175" }}>
+                Current Global Default Strategy:
+              </span>
+              <div style={{ fontSize: "13px", fontWeight: 600, color: "#202223", marginTop: "2px" }}>
+                {globalSettings.inventorySyncMode === "single"
+                  ? `Single Location: ${
+                      locations.find((l) => l.id === globalSettings.targetLocationId)?.name ||
+                      globalSettings.targetLocationId ||
+                      "Primary Location"
+                    }`
+                  : `Equal Split across ${
+                      globalSettings.splitLocationIds.length
+                    } locations (${globalSettings.splitLocationIds
+                      .map((id) => locations.find((l) => l.id === id)?.name || id)
+                      .join(", ")})`}
+              </div>
+            </div>
+            <span style={{ fontSize: "12px", color: "#6d7175" }}>
+              To change storewide rules, visit{" "}
+              <a href="/app/settings" style={{ color: "#008060", fontWeight: 600 }}>
+                Settings
+              </a>
+              .
+            </span>
+          </div>
+        )}
+
+        {/* Override Toggle Checkbox */}
+        <label
+          style={{
+            display: "flex",
+            alignItems: "flex-start",
+            gap: "10px",
+            padding: "12px 14px",
+            backgroundColor: useOverride ? "#fefce8" : "#f9fafb",
+            border: `1px solid ${useOverride ? "#fde047" : "#e1e3e5"}`,
+            borderRadius: "8px",
+            cursor: "pointer",
+            transition: "all 0.15s ease",
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={useOverride}
+            onChange={(e) => setUseOverride(e.target.checked)}
+            style={{ accentColor: "#008060", marginTop: "3px", width: "16px", height: "16px" }}
+          />
+          <div>
+            <span style={{ fontSize: "14px", fontWeight: 600, color: "#202223" }}>
+              Use custom location rules for this product (Override global settings)
+            </span>
+            <p style={{ margin: "2px 0 0 0", fontSize: "12px", color: "#6d7175" }}>
+              When checked, inventory synchronization for this product distributes stock according to the custom strategy below instead of global store settings.
+            </p>
+          </div>
+        </label>
+
+        {/* Revealed Strategy Controls when Override is Active */}
+        {useOverride && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "16px", marginTop: "4px" }}>
+            {/* Mode Radios */}
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
+                gap: "12px",
+              }}
+            >
+              {/* Single Mode Card */}
+              <div
+                onClick={() => setProductMode("single")}
+                style={{
+                  padding: "12px 14px",
+                  borderRadius: "8px",
+                  border: `2px solid ${productMode === "single" ? "#008060" : "#e1e3e5"}`,
+                  backgroundColor: productMode === "single" ? "#f3fdf7" : "#ffffff",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: "10px",
+                }}
+              >
+                <input
+                  type="radio"
+                  name="product_mode_choice"
+                  checked={productMode === "single"}
+                  onChange={() => setProductMode("single")}
+                  style={{ marginTop: "3px", accentColor: "#008060" }}
+                />
+                <div>
+                  <div style={{ fontSize: "13px", fontWeight: 600, color: "#202223" }}>
+                    Single Location Mode
+                  </div>
+                  <p style={{ margin: "2px 0 0 0", fontSize: "12px", color: "#6d7175" }}>
+                    Route 100% of this product's variant stock to one chosen Shopify location.
+                  </p>
+                </div>
+              </div>
+
+              {/* Split Mode Card */}
+              <div
+                onClick={() => setProductMode("split_equal")}
+                style={{
+                  padding: "12px 14px",
+                  borderRadius: "8px",
+                  border: `2px solid ${productMode === "split_equal" ? "#008060" : "#e1e3e5"}`,
+                  backgroundColor: productMode === "split_equal" ? "#f3fdf7" : "#ffffff",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: "10px",
+                }}
+              >
+                <input
+                  type="radio"
+                  name="product_mode_choice"
+                  checked={productMode === "split_equal"}
+                  onChange={() => setProductMode("split_equal")}
+                  style={{ marginTop: "3px", accentColor: "#008060" }}
+                />
+                <div>
+                  <div style={{ fontSize: "13px", fontWeight: 600, color: "#202223" }}>
+                    Split Equally Across Locations
+                  </div>
+                  <p style={{ margin: "2px 0 0 0", fontSize: "12px", color: "#6d7175" }}>
+                    Divide this product's stock equally among chosen locations with remainder preservation.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Single Location Dropdown */}
+            {productMode === "single" && (
+              <div
+                style={{
+                  padding: "14px 16px",
+                  backgroundColor: "#f9fafb",
+                  borderRadius: "8px",
+                  border: "1px solid #e1e3e5",
+                }}
+              >
+                <label
+                  htmlFor="productTargetLocation"
+                  style={{
+                    display: "block",
+                    fontSize: "13px",
+                    fontWeight: 600,
+                    color: "#202223",
+                    marginBottom: "6px",
+                  }}
+                >
+                  Target Shopify Location for this Product
+                </label>
+                <select
+                  id="productTargetLocation"
+                  value={productTargetLoc}
+                  onChange={(e) => setProductTargetLoc(e.target.value)}
+                  style={{
+                    width: "100%",
+                    maxWidth: "380px",
+                    padding: "8px 12px",
+                    borderRadius: "6px",
+                    border: "1px solid #c9cccf",
+                    fontSize: "13px",
+                    backgroundColor: "#ffffff",
+                    color: "#202223",
+                    outline: "none",
+                  }}
+                >
+                  <option value="" disabled>
+                    -- Select Target Location --
+                  </option>
+                  {locations.map((loc) => (
+                    <option key={loc.id} value={loc.id}>
+                      {loc.name} {loc.isPrimary ? "(Primary)" : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {/* Split Mode Checkboxes */}
+            {productMode === "split_equal" && (
+              <div
+                style={{
+                  padding: "14px 16px",
+                  backgroundColor: "#f9fafb",
+                  borderRadius: "8px",
+                  border: "1px solid #e1e3e5",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    marginBottom: "10px",
+                    flexWrap: "wrap",
+                    gap: "8px",
+                  }}
+                >
+                  <div>
+                    <label style={{ fontSize: "13px", fontWeight: 600, color: "#202223" }}>
+                      Participating Locations (Minimum 2 required)
+                    </label>
+                    <p style={{ margin: "2px 0 0 0", fontSize: "12px", color: "#6d7175" }}>
+                      Selected: {productSplitLocs.length} locations
+                    </p>
+                  </div>
+                  <div style={{ display: "flex", gap: "6px" }}>
+                    <button
+                      type="button"
+                      onClick={() => setProductSplitLocs(locations.map((l) => l.id))}
+                      style={{
+                        padding: "3px 8px",
+                        fontSize: "11px",
+                        fontWeight: 600,
+                        color: "#008060",
+                        backgroundColor: "#ffffff",
+                        border: "1px solid #c9cccf",
+                        borderRadius: "4px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Select All
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setProductSplitLocs([])}
+                      style={{
+                        padding: "3px 8px",
+                        fontSize: "11px",
+                        fontWeight: 600,
+                        color: "#6d7175",
+                        backgroundColor: "#ffffff",
+                        border: "1px solid #c9cccf",
+                        borderRadius: "4px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Clear All
+                    </button>
+                  </div>
+                </div>
+
+                {productSplitLocs.length < 2 && (
+                  <div
+                    style={{
+                      padding: "6px 10px",
+                      backgroundColor: "#fffbeb",
+                      border: "1px solid #fef3c7",
+                      borderRadius: "6px",
+                      color: "#b45309",
+                      fontSize: "12px",
+                      fontWeight: 600,
+                      marginBottom: "10px",
+                    }}
+                  >
+                    ⚠️ Select at least 2 locations for equal split distribution.
+                  </div>
+                )}
+
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))",
+                    gap: "8px",
+                  }}
+                >
+                  {locations.map((loc) => {
+                    const isChecked = productSplitLocs.includes(loc.id);
+                    return (
+                      <label
+                        key={loc.id}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "8px",
+                          padding: "8px 12px",
+                          backgroundColor: isChecked ? "#f0fdf4" : "#ffffff",
+                          border: `1px solid ${isChecked ? "#86efac" : "#e1e3e5"}`,
+                          borderRadius: "6px",
+                          cursor: "pointer",
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          onChange={() => {
+                            setProductSplitLocs((prev: string[]) =>
+                              prev.includes(loc.id)
+                                ? prev.filter((id: string) => id !== loc.id)
+                                : [...prev, loc.id]
+                            );
+                          }}
+                          style={{ accentColor: "#008060", width: "15px", height: "15px" }}
+                        />
+                        <span style={{ fontSize: "13px", fontWeight: 500, color: "#202223" }}>
+                          {loc.name} {loc.isPrimary ? "(Primary)" : ""}
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Real-Time Stock Breakdown Section */}
@@ -575,27 +1269,38 @@ export default function ProductDetailPage() {
                   <th style={{ padding: "10px 14px", fontSize: "12px", color: "#6d7175" }}>Stock Code</th>
                   <th style={{ padding: "10px 14px", fontSize: "12px", color: "#6d7175" }}>Variant Description</th>
                   <th style={{ padding: "10px 14px", fontSize: "12px", color: "#6d7175" }}>Available Stock</th>
+                  <th style={{ padding: "10px 14px", fontSize: "12px", color: "#6d7175" }}>Price</th>
                   <th style={{ padding: "10px 14px", fontSize: "12px", color: "#6d7175" }}>Status</th>
                 </tr>
               </thead>
               <tbody>
-                {stock.map((item, idx) => (
-                  <tr key={idx} style={{ borderBottom: "1px solid #f1f2f3" }}>
-                    <td style={{ padding: "10px 14px", fontSize: "13px", fontWeight: 600 }}>{item.stock_code}</td>
-                    <td style={{ padding: "10px 14px", fontSize: "13px", color: "#5c5f62" }}>{item.description}</td>
-                    <td style={{ padding: "10px 14px", fontSize: "13px", fontWeight: 700 }}>
-                      {item.quantity.toLocaleString()}
-                    </td>
-                    <td style={{ padding: "10px 14px" }}>
-                      <StockBadge
-                        quantity={item.quantity}
-                        nextShipment={item.next_shipment}
-                        dueDate={item.due_date}
-                        size="sm"
-                      />
-                    </td>
-                  </tr>
-                ))}
+                {stock.map((item, idx) => {
+                  const variantPrice = getVariantPrice(item, product);
+                  return (
+                    <tr key={idx} style={{ borderBottom: "1px solid #f1f2f3" }}>
+                      <td style={{ padding: "10px 14px", fontSize: "13px", fontWeight: 600 }}>{item.stock_code}</td>
+                      <td style={{ padding: "10px 14px", fontSize: "13px", color: "#5c5f62" }}>{item.description}</td>
+                      <td style={{ padding: "10px 14px", fontSize: "13px", fontWeight: 700 }}>
+                        {(Number(item.quantity) || 0).toLocaleString()}
+                      </td>
+                      <td style={{ padding: "10px 14px", fontSize: "13px", fontWeight: 600, color: "#202223" }}>
+                        {variantPrice !== null && variantPrice !== undefined ? (
+                          formatCurrency(variantPrice, currentRegion)
+                        ) : (
+                          <span style={{ color: "#8c9196" }}>-</span>
+                        )}
+                      </td>
+                      <td style={{ padding: "10px 14px" }}>
+                        <StockBadge
+                          quantity={typeof item.quantity === "number" ? item.quantity : Number(item.quantity) || 0}
+                          nextShipment={item.next_shipment && item.next_shipment > 0 ? item.next_shipment : undefined}
+                          dueDate={item.due_date && item.due_date !== "-" ? item.due_date : null}
+                          size="sm"
+                        />
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

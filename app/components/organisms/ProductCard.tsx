@@ -1,5 +1,6 @@
 import React from "react";
 import type { ProductData } from "../../../shared/types/trends.types";
+import { normalizePricing } from "../../../shared/types/trends.types";
 import { PriceTag } from "../atoms/PriceTag";
 import { StockBadge } from "../molecules/StockBadge";
 
@@ -25,16 +26,29 @@ export const ProductCard: React.FC<ProductCardProps> = ({
   shopifyAdminUrl,
 }) => {
   const primaryImage = product.images?.[0]?.link || "";
-  const primaryPricing = product.pricing?.[0]?.prices?.[0]?.price;
+  const pricingList = normalizePricing(product.pricing);
+  const primaryPricing = pricingList[0]?.prices?.[0]?.price;
   const [hasImageError, setHasImageError] = React.useState(false);
 
   React.useEffect(() => {
     setHasImageError(false);
   }, [primaryImage]);
 
+  // Normalize colours: live API may return a string or string[] — always coerce to string[]
+  const colours: string[] = Array.isArray(product.colours)
+    ? product.colours
+    : typeof product.colours === "string" && (product.colours as string).length > 0
+      ? (product.colours as string).split(",").map((c) => c.trim())
+      : [];
+
   // Calculate total stock across all variants/stock items
-  const totalStock = product.stock?.reduce((acc, curr) => acc + (curr.quantity || 0), 0) || 0;
-  const nextShipment = product.stock?.find((s) => s.next_shipment && s.next_shipment > 0);
+  const stockList = Array.isArray(product.stock) ? product.stock : [];
+  const hasStock = stockList.length > 0;
+  const totalStock = hasStock
+    ? stockList.reduce((acc, curr) => acc + (typeof curr.quantity === "number" ? curr.quantity : Number(curr.quantity) || 0), 0)
+    : null;
+  const nextShipment = stockList.find((s) => s.next_shipment && s.next_shipment > 0);
+  const isIndent = Boolean(pricingList.some((p) => p.type?.toLowerCase() === "indent"));
 
   return (
     <div
@@ -188,9 +202,9 @@ export const ProductCard: React.FC<ProductCardProps> = ({
           {product.name}
         </h4>
 
-        {product.colours && product.colours.length > 0 && (
+        {colours.length > 0 && (
           <div style={{ display: "flex", flexWrap: "wrap", gap: "4px" }}>
-            {product.colours.slice(0, 4).map((c, i) => (
+            {colours.slice(0, 4).map((c, i) => (
               <span
                 key={i}
                 style={{
@@ -204,9 +218,9 @@ export const ProductCard: React.FC<ProductCardProps> = ({
                 {c}
               </span>
             ))}
-            {product.colours.length > 4 && (
+            {colours.length > 4 && (
               <span style={{ fontSize: "10px", color: "#8c9196" }}>
-                +{product.colours.length - 4} more
+                +{colours.length - 4} more
               </span>
             )}
           </div>
@@ -235,6 +249,8 @@ export const ProductCard: React.FC<ProductCardProps> = ({
           <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
             <StockBadge
               quantity={totalStock}
+              isUntracked={!hasStock && isIndent}
+              pricingType={pricingList[0]?.type}
               nextShipment={nextShipment?.next_shipment}
               dueDate={nextShipment?.due_date}
               size="sm"

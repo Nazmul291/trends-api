@@ -52,7 +52,14 @@ interface ProductDetailState {
   fetchLeadTimes: (options?: { bypassCache?: boolean }) => Promise<void>;
   loadProductDetailsWithStock: (productId: string | number) => Promise<void>;
   checkSyncStatus: (productId: string | number) => Promise<void>;
-  syncProductToShopify: (productOverride?: ProductData) => Promise<boolean>;
+  syncProductToShopify: (
+    productOverride?: ProductData,
+    locationOptions?: {
+      inventorySyncMode?: "single" | "split_equal";
+      targetLocationId?: string | null;
+      splitLocationIds?: string[];
+    }
+  ) => Promise<boolean>;
   deleteProductFromShopify: () => Promise<boolean>;
   clearProduct: () => void;
 }
@@ -108,7 +115,12 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
       }
 
       const envelope = (await res.json()) as ApiProxyResponse<ProductShowData>;
-      const product = envelope.data?.data || null;
+      const rawData = envelope.data?.data;
+      const product = Array.isArray(rawData) ? rawData[0] || null : rawData || null;
+
+      if (product?.stock && Array.isArray(product.stock) && product.stock.length > 0) {
+        set({ stock: product.stock, stockStatus: "success", stockError: null });
+      }
 
       set({
         product,
@@ -150,13 +162,15 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
       }
 
       const envelope = (await res.json()) as ApiProxyResponse<StockListData>;
-      const stock = envelope.data?.data || [];
+      const rawStock = envelope.data?.data;
+      const stock = Array.isArray(rawStock) ? rawStock : [];
 
-      set({
+      set((state) => ({
         stock,
         stockStatus: "success",
         stockError: null,
-      });
+        product: state.product ? { ...state.product, stock } : state.product,
+      }));
     } catch (err: unknown) {
       if ((err as Error)?.name === "AbortError") return;
       set({
@@ -235,7 +249,14 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
     }
   },
 
-  syncProductToShopify: async (productOverride?: ProductData) => {
+  syncProductToShopify: async (
+    productOverride?: ProductData,
+    locationOptions?: {
+      inventorySyncMode?: "single" | "split_equal";
+      targetLocationId?: string | null;
+      splitLocationIds?: string[];
+    }
+  ) => {
     const targetProduct = productOverride || get().product;
     if (!targetProduct) {
       set({
@@ -256,6 +277,15 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
           productId: targetProduct.code,
           product: targetProduct,
           region,
+          ...(locationOptions?.inventorySyncMode
+            ? { inventorySyncMode: locationOptions.inventorySyncMode }
+            : {}),
+          ...(locationOptions?.targetLocationId !== undefined
+            ? { targetLocationId: locationOptions.targetLocationId }
+            : {}),
+          ...(locationOptions?.splitLocationIds !== undefined
+            ? { splitLocationIds: locationOptions.splitLocationIds }
+            : {}),
         }),
       });
 

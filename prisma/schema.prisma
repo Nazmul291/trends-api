@@ -40,6 +40,10 @@ model TrendProductSync {
   trendsCode       String
   region           String
   syncLocks        String[]           @default([])
+  // Per-product Inventory Distribution Override
+  inventorySyncMode String?
+  targetLocationId  String?
+  splitLocationIds  String[]           @default([])
   lastSyncedAt     DateTime           @default(now())
   createdAt        DateTime           @default(now())
   updatedAt        DateTime           @updatedAt
@@ -53,6 +57,7 @@ model TrendVariantSync {
   id               String           @id @default(uuid())
   productSyncId    String
   shopifyVariantId String           @unique
+  inventoryItemId  String?
   stockCode        String
   region           String
   lastStockQty     Int              @default(0)
@@ -61,6 +66,7 @@ model TrendVariantSync {
   productSync      TrendProductSync @relation(fields: [productSyncId], references: [id], onDelete: Cascade)
 
   @@index([stockCode, region])
+  @@index([inventoryItemId])
 }
 
 model TrendOrderDispatch {
@@ -76,5 +82,33 @@ model TrendOrderDispatch {
   updatedAt        DateTime @updatedAt
 
   @@index([shop, status])
+}
+
+/// Per-shop application settings — stores Trends API key, mock fallback flag, and enabled regions.
+/// Falls back to environment variables when no DB record exists for a shop.
+model AppSettings {
+  id                      String   @id @default(uuid())
+  shop                    String   @unique
+  trendsApiKey            String?
+  enableTrendsMockFallback Boolean  @default(true)
+  enabledRegions          String[] @default(["nz", "au", "sg"])
+
+  // Automated Background Sync Configuration
+  autoSyncEnabled         Boolean  @default(true)
+  syncFrequency           String   @default("daily")
+  syncTime                String   @default("02:00")
+  syncBatchSize           Int      @default(50)
+  syncScope               String[] @default(["inventory", "price"])
+  lastSyncedAt            DateTime?
+  syncStatus              String   @default("idle")
+  syncErrorMessage        String?
+
+  // Inventory Location Strategy
+  inventorySyncMode       String   @default("single")
+  targetLocationId        String?
+  splitLocationIds        String[] @default([])
+
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
 }
 

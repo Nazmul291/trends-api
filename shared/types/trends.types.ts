@@ -21,6 +21,10 @@ export const REGION_CONFIGS: Record<Region, RegionalServerConfig> = {
   sg: { region: "sg", url: "https://sg.api.trends.nz", currency: "SGD", name: "Singapore" },
 };
 
+/** All supported region codes — safe to import on the client. */
+export const ALL_REGIONS: Region[] = ["nz", "au", "sg"];
+
+
 // ==========================================
 // 1. Lead Times Models
 // ==========================================
@@ -170,7 +174,18 @@ export interface ProductData {
   product_wire?: string;
   product_wire_last_updated?: string;
   stock?: StockItemData[];
-  pricing?: PricingData[];
+  pricing?: PricingData[] | PricingData;
+}
+
+/**
+ * Normalizes product pricing: live API may return a single object or an array.
+ * Always returns a clean PricingData[] array.
+ */
+export function normalizePricing(pricing: unknown): PricingData[] {
+  if (!pricing) return [];
+  if (Array.isArray(pricing)) return pricing;
+  if (typeof pricing === "object") return [pricing as PricingData];
+  return [];
 }
 
 export interface ProductListData {
@@ -186,13 +201,16 @@ export interface ProductListData {
 export interface ProductShowData {
   status: string;
   country: string;
-  data: ProductData;
+  data: ProductData | ProductData[];
 }
 
 export interface ListProductsQuery {
+  page_size?: number;
   category_no?: number | string;
   page_no?: number;
   last_updated?: string;
+  inc_discontinued?: boolean;
+  inc_inactive?: boolean;
   [key: string]: unknown;
 }
 
@@ -206,6 +224,8 @@ export interface StockItemData {
   quantity: number;
   next_shipment?: number;
   due_date?: string | null;
+  price?: number | string | null;
+  unit_price?: number | string | null;
 }
 
 export interface StockListData {
@@ -277,6 +297,10 @@ export interface ListOrdersQuery {
   ponum?: string;
 }
 
+/**
+ * @deprecated The Trends API v1 specification is read-only and does not support POST /orders.
+ * Retained temporarily only for backwards compatibility with any legacy mock references.
+ */
 export interface CreateOrderPayload {
   purchase_order_number: string;
   contact_email: string;
