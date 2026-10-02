@@ -21,6 +21,10 @@ export const REGION_CONFIGS: Record<Region, RegionalServerConfig> = {
   sg: { region: "sg", url: "https://sg.api.trends.nz", currency: "SGD", name: "Singapore" },
 };
 
+/** All supported region codes — safe to import on the client. */
+export const ALL_REGIONS: Region[] = ["nz", "au", "sg"];
+
+
 // ==========================================
 // 1. Lead Times Models
 // ==========================================

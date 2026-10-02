@@ -5,9 +5,10 @@ import { authenticate } from "../shopify.server";
 import {
   getAppSettings,
   saveAppSettings,
-  ALL_REGIONS,
 } from "../../server/settings/app-settings.service";
 import type { Region } from "../../shared/types/trends.types";
+import { ALL_REGIONS } from "../../shared/types/trends.types";
+
 
 // ---------------------------------------------------------------------------
 // Region display metadata

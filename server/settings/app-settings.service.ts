@@ -10,12 +10,10 @@
 
 import prisma from "../../app/db.server";
 import type { Region } from "../../shared/types/trends.types";
+import { ALL_REGIONS } from "../../shared/types/trends.types";
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+export { ALL_REGIONS };
 
-export const ALL_REGIONS: Region[] = ["nz", "au", "sg"];
 
 // ---------------------------------------------------------------------------
 // Types
