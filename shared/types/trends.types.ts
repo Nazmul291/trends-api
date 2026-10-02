@@ -174,7 +174,18 @@ export interface ProductData {
   product_wire?: string;
   product_wire_last_updated?: string;
   stock?: StockItemData[];
-  pricing?: PricingData[];
+  pricing?: PricingData[] | PricingData;
+}
+
+/**
+ * Normalizes product pricing: live API may return a single object or an array.
+ * Always returns a clean PricingData[] array.
+ */
+export function normalizePricing(pricing: unknown): PricingData[] {
+  if (!pricing) return [];
+  if (Array.isArray(pricing)) return pricing;
+  if (typeof pricing === "object") return [pricing as PricingData];
+  return [];
 }
 
 export interface ProductListData {

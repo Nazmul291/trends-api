@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ProductData, Region, StockListData } from "../../shared/types/trends.types";
+import { normalizePricing } from "../../shared/types/trends.types";
 import { TrendsApiClient } from "../api-client/trends-client";
 import prisma from "../../app/db.server";
 
@@ -83,8 +84,9 @@ function buildDescriptionHtml(product: ProductData): string {
  * Extracts base wholesale price formatted to 2 decimal places in regional currency.
  */
 export function extractBasePrice(product: ProductData, region: Region): string {
-  if (product.pricing && product.pricing.length > 0) {
-    for (const group of product.pricing) {
+  const pricingList = normalizePricing(product.pricing);
+  if (pricingList.length > 0) {
+    for (const group of pricingList) {
       if (group.prices && group.prices.length > 0) {
         for (const p of group.prices) {
           const raw = p.price;
@@ -596,7 +598,7 @@ export async function syncTrendProductToShopify({
         namespace: "trends",
         key: "quantity_breaks",
         type: "json",
-        value: JSON.stringify(trendsProduct.pricing?.[0]?.prices || []),
+        value: JSON.stringify(normalizePricing(trendsProduct.pricing)[0]?.prices || []),
       },
       {
         namespace: "trends",

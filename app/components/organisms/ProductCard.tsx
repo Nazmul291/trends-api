@@ -1,5 +1,6 @@
 import React from "react";
 import type { ProductData } from "../../../shared/types/trends.types";
+import { normalizePricing } from "../../../shared/types/trends.types";
 import { PriceTag } from "../atoms/PriceTag";
 import { StockBadge } from "../molecules/StockBadge";
 
@@ -25,7 +26,8 @@ export const ProductCard: React.FC<ProductCardProps> = ({
   shopifyAdminUrl,
 }) => {
   const primaryImage = product.images?.[0]?.link || "";
-  const primaryPricing = product.pricing?.[0]?.prices?.[0]?.price;
+  const pricingList = normalizePricing(product.pricing);
+  const primaryPricing = pricingList[0]?.prices?.[0]?.price;
   const [hasImageError, setHasImageError] = React.useState(false);
 
   React.useEffect(() => {
@@ -46,7 +48,7 @@ export const ProductCard: React.FC<ProductCardProps> = ({
     ? stockList.reduce((acc, curr) => acc + (typeof curr.quantity === "number" ? curr.quantity : Number(curr.quantity) || 0), 0)
     : null;
   const nextShipment = stockList.find((s) => s.next_shipment && s.next_shipment > 0);
-  const isIndent = Boolean(product.pricing?.some((p) => p.type?.toLowerCase() === "indent"));
+  const isIndent = Boolean(pricingList.some((p) => p.type?.toLowerCase() === "indent"));
 
   return (
     <div
@@ -248,7 +250,7 @@ export const ProductCard: React.FC<ProductCardProps> = ({
             <StockBadge
               quantity={totalStock}
               isUntracked={!hasStock && isIndent}
-              pricingType={product.pricing?.[0]?.type}
+              pricingType={pricingList[0]?.type}
               nextShipment={nextShipment?.next_shipment}
               dueDate={nextShipment?.due_date}
               size="sm"

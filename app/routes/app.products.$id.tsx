@@ -11,6 +11,7 @@ import { Skeleton } from "../components/atoms/Skeleton";
 import { StockBadge } from "../components/molecules/StockBadge";
 import { LeadTimeIndicator } from "../components/molecules/LeadTimeIndicator";
 import { formatCurrency } from "../../shared/utils/formatters";
+import { normalizePricing } from "../../shared/types/trends.types";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   await authenticate.admin(request);
@@ -123,13 +124,14 @@ export default function ProductDetailPage() {
 
   const images = product.images || [];
   const activeImage = images[activeImageIndex]?.link || "https://placehold.co/500x500?text=No+Image";
-  const primaryPricing = product.pricing?.[0];
+  const pricingList = normalizePricing(product.pricing);
+  const primaryPricing = pricingList[0];
   const stockList = Array.isArray(stock) && stock.length > 0 ? stock : Array.isArray(product.stock) ? product.stock : [];
   const hasStockData = stockList.length > 0;
   const totalStock = hasStockData
     ? stockList.reduce((sum, item) => sum + (typeof item.quantity === "number" ? item.quantity : Number(item.quantity) || 0), 0)
     : 0;
-  const isIndent = Boolean(product.pricing?.some((p) => p.type?.toLowerCase() === "indent"));
+  const isIndent = Boolean(pricingList.some((p) => p.type?.toLowerCase() === "indent"));
 
   // Normalize colours: live API may return a string or string[] — always coerce to string[]
   const productColours: string[] = Array.isArray(product.colours)

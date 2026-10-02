@@ -1,5 +1,6 @@
 import type { LoaderFunctionArgs, ActionFunctionArgs } from "react-router";
 import type { Region, ApiProxyResponse, ProductData, ProductShowData } from "../../shared/types/trends.types";
+import { normalizePricing } from "../../shared/types/trends.types";
 import { cacheAdapter, CacheKeyBuilder, DEFAULT_CACHE_CONFIG } from "../../server/cache";
 import { TrendsApiClient } from "../../server/api-client/trends-client";
 import {
@@ -143,12 +144,13 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       settings: appSettings,
     });
 
-    // If fetching the product catalog list, enrich each product with live/cached stock
+    // If fetching the product catalog list, enrich each product with live/cached stock & normalize pricing
     if (endpoint === "products" && upstreamRes.data && typeof upstreamRes.data === "object") {
       const listData = upstreamRes.data as any;
       if (Array.isArray(listData.data) && listData.data.length > 0) {
         await Promise.all(
           listData.data.map(async (prod: any) => {
+            prod.pricing = normalizePricing(prod.pricing);
             if ((!prod.stock || prod.stock.length === 0) && prod.code) {
               try {
                 const stockCacheKey = CacheKeyBuilder.stock(region, String(prod.code));
@@ -179,6 +181,9 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       const showData = upstreamRes.data as any;
       if (Array.isArray(showData.data) && showData.data.length > 0) {
         showData.data = showData.data[0];
+      }
+      if (showData.data && typeof showData.data === "object") {
+        showData.data.pricing = normalizePricing(showData.data.pricing);
       }
     }
 
