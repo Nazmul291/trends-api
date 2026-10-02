@@ -1,5 +1,6 @@
 import type { Region } from "../../shared/types/trends.types";
 import { getRegionalUpstreamConfig } from "./credentials";
+import type { AppSettingsData } from "../settings/app-settings.service";
 import {
   MOCK_CATEGORIES,
   MOCK_LEAD_TIMES,
@@ -14,6 +15,8 @@ export interface RequestOptions {
   params?: Record<string, unknown> | URLSearchParams;
   body?: unknown;
   timeoutMs?: number;
+  /** Resolved app settings (DB record or env fallback). */
+  settings?: AppSettingsData | null;
 }
 
 export interface TrendsApiResponse<T> {
@@ -24,20 +27,29 @@ export interface TrendsApiResponse<T> {
 
 export class TrendsApiClient {
   /**
-   * Dispatches request to the regional upstream TRENDS API, or provides fallback mock data if credentials are absent.
+   * Dispatches request to the regional upstream TRENDS API, or provides fallback
+   * mock data if credentials are absent.
+   *
+   * Settings are passed in (not read directly from process.env) so the DB-backed
+   * configuration takes effect without breaking existing callers.
    */
   static async request<T>(
     region: Region,
     endpointPath: string,
     options: RequestOptions = {}
   ): Promise<TrendsApiResponse<T>> {
-    const { baseUrl, headers, hasCredentials } = getRegionalUpstreamConfig(region);
-    const { method = "GET", params, body, timeoutMs = 12000 } = options;
+    const { method = "GET", params, body, timeoutMs = 12000, settings } = options;
+    const { baseUrl, headers, hasCredentials } = getRegionalUpstreamConfig(region, settings);
 
-    // Check if fallback to mock data is enabled when credentials are missing
+    // Determine whether mock fallback is permitted.
+    // Priority: DB settings → ENABLE_TRENDS_MOCK_FALLBACK env var → true (default)
+    const mockFallbackEnabled =
+      settings != null
+        ? settings.enableTrendsMockFallback
+        : process.env.ENABLE_TRENDS_MOCK_FALLBACK !== "false";
+
     const allowMockFallback =
-      process.env.ENABLE_TRENDS_MOCK_FALLBACK !== "false" &&
-      (!hasCredentials || process.env.NODE_ENV !== "production");
+      mockFallbackEnabled && (!hasCredentials || process.env.NODE_ENV !== "production");
 
     if (!hasCredentials) {
       if (allowMockFallback) {
@@ -56,7 +68,7 @@ export class TrendsApiClient {
 
       throw {
         status: 401,
-        message: `Missing TRENDS API credentials for region '${region.toUpperCase()}'. Please configure TRENDS_API_KEY_${region.toUpperCase()} in your .env file.`,
+        message: `Missing TRENDS API credentials for region '${region.toUpperCase()}'. Please configure the Trends API Key in the Settings page.`,
       };
     }
 
@@ -121,7 +133,7 @@ export class TrendsApiClient {
         if (res.status === 401) {
           throw {
             status: 401,
-            message: `TRENDS API upstream returned 401 Unauthorized for region '${region.toUpperCase()}'. Please verify that your API credentials in .env are valid.`,
+            message: `TRENDS API upstream returned 401 Unauthorized for region '${region.toUpperCase()}'. Please verify that your API credentials in Settings are valid.`,
             data: responseData,
           };
         }
@@ -145,7 +157,7 @@ export class TrendsApiClient {
         };
       }
 
-      // If upstream failed with 401 and mock fallback is enabled in dev, allow fallback
+      // If upstream failed and mock fallback is enabled in dev, allow fallback
       if (allowMockFallback) {
         console.warn(
           `[TRENDS API Proxy] Upstream request failed (${(err as { message?: string })?.message || "error"}). Falling back to mock dataset for local development.`

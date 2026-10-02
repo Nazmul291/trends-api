@@ -9,6 +9,7 @@ import {
 } from "../../server/services/shopify-sync.service";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
+import { getAppSettings } from "../../server/settings/app-settings.service";
 
 /**
  * Helper to parse region and endpoint path from request
@@ -72,6 +73,9 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     }
   }
 
+  // Load DB-backed settings (falls back to env vars if no record exists)
+  const appSettings = await getAppSettings(shop);
+
   const url = new URL(request.url);
   const { region, endpoint } = parseProxyTarget(params, url);
 
@@ -131,6 +135,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     const upstreamRes = await TrendsApiClient.request<unknown>(region, endpoint, {
       method: "GET",
       params: queryParams,
+      settings: appSettings,
     });
 
     // 3. Populate Cache
@@ -185,6 +190,9 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       shop = latestSession.shop;
     }
   }
+
+  // Load DB-backed settings (falls back to env vars if no record exists)
+  const appSettings = await getAppSettings(shop);
 
   const url = new URL(request.url);
   const { region, endpoint } = parseProxyTarget(params, url);
@@ -249,7 +257,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 
       let productToSync = body.product || body.trendsProduct;
       if (!productToSync && body.productId) {
-        const showRes = await TrendsApiClient.request<ProductShowData>(region, `products/${body.productId}`);
+        const showRes = await TrendsApiClient.request<ProductShowData>(region, `products/${body.productId}`, { settings: appSettings });
         productToSync = showRes.data?.data;
       }
 
@@ -296,6 +304,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     const upstreamRes = await TrendsApiClient.request<unknown>(region, endpoint, {
       method: request.method as "POST" | "PUT" | "DELETE",
       body,
+      settings: appSettings,
     });
 
     const response: ApiProxyResponse<unknown> = {

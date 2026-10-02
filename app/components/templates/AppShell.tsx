@@ -1,5 +1,6 @@
 import React from "react";
 import { RegionSelector } from "../molecules/RegionSelector";
+import { useRegionStore } from "../../stores/useRegionStore";
 
 export interface AppShellProps {
   children: React.ReactNode;
@@ -12,6 +13,7 @@ export const AppShell: React.FC<AppShellProps> = ({
   activeTab = "catalog",
   onTabChange,
 }) => {
+  const enabledRegions = useRegionStore((s) => s.enabledRegions);
   return (
     <div
       style={{
@@ -82,7 +84,7 @@ export const AppShell: React.FC<AppShellProps> = ({
           )}
         </div>
 
-        <RegionSelector />
+        {enabledRegions.length > 1 && <RegionSelector enabledRegions={enabledRegions} />}
       </header>
 
       <main style={{ padding: "24px", maxWidth: "1400px", width: "100%", margin: "0 auto", flex: 1 }}>

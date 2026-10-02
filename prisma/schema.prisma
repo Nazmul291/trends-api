@@ -78,3 +78,15 @@ model TrendOrderDispatch {
   @@index([shop, status])
 }
 
+/// Per-shop application settings — stores Trends API key, mock fallback flag, and enabled regions.
+/// Falls back to environment variables when no DB record exists for a shop.
+model AppSettings {
+  id                      String   @id @default(uuid())
+  shop                    String   @unique
+  trendsApiKey            String?
+  enableTrendsMockFallback Boolean  @default(true)
+  enabledRegions          String[] @default(["nz", "au", "sg"])
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+}
+

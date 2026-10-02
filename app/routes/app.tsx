@@ -5,22 +5,29 @@ import { AppProvider } from "@shopify/shopify-app-react-router/react";
 
 import { authenticate } from "../shopify.server";
 import { RegionSelector } from "../components/molecules/RegionSelector";
+import { getAppSettings } from "../../server/settings/app-settings.service";
+import type { Region } from "../../shared/types/trends.types";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  await authenticate.admin(request);
+  const { session } = await authenticate.admin(request);
+  const settings = await getAppSettings(session.shop);
 
   // eslint-disable-next-line no-undef
-  return { apiKey: process.env.SHOPIFY_API_KEY || "" };
+  return {
+    apiKey: process.env.SHOPIFY_API_KEY || "",
+    enabledRegions: settings.enabledRegions as Region[],
+  };
 };
 
 export default function App() {
-  const { apiKey } = useLoaderData<typeof loader>();
+  const { apiKey, enabledRegions } = useLoaderData<typeof loader>();
 
   return (
     <AppProvider apiKey={apiKey}>
       <s-app-nav>
         <s-link href="/app">Product Catalog</s-link>
-        <s-link href="/app/orders">Orders & Tracking</s-link>
+        <s-link href="/app/orders">Orders &amp; Tracking</s-link>
+        <s-link href="/app/settings">Settings</s-link>
       </s-app-nav>
 
       <div
@@ -40,7 +47,8 @@ export default function App() {
             TRENDS Promotional Gateway
           </span>
         </div>
-        <RegionSelector />
+        {/* Only render the selector if there is more than one enabled region */}
+        {enabledRegions.length > 1 && <RegionSelector enabledRegions={enabledRegions} />}
       </div>
 
       <div style={{ padding: "0 24px 32px 24px" }}>
