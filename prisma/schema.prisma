@@ -118,3 +118,22 @@ model AppSettings {
   updatedAt               DateTime @updatedAt
 }
 
+model TrendSyncJob {
+  id           String    @id @default(uuid())
+  shop         String
+  trendsCode   String
+  region       String
+  status       String    @default("QUEUED") // QUEUED, IN_PROGRESS, COMPLETED, FAILED
+  stage        String    @default("QUEUED") // STAGE_1_PRODUCT_VARIANTS, STAGE_2_MEDIA_LINKING, STAGE_3_INVENTORY_DISTRIBUTION, COMPLETED, FAILED
+  progress     Int       @default(0) // 0-100%
+  message      String?
+  errorMessage String?
+  result       Json?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([shop, trendsCode])
+  @@index([shop, status])
+  @@index([createdAt])
+}
+

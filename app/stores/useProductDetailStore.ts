@@ -29,6 +29,10 @@ interface ProductDetailState {
   // Shopify Sync State
   syncStatus: StoreStatus;
   syncError: string | null;
+  syncJobId: string | null;
+  syncStage: string | null;
+  syncProgress: number;
+  syncMessage: string | null;
   syncResult: {
     action: "created" | "updated";
     shopifyProductId: string;
@@ -66,6 +70,93 @@ interface ProductDetailState {
 
 let productAbortController: AbortController | null = null;
 let stockAbortController: AbortController | null = null;
+let syncPollInterval: ReturnType<typeof setInterval> | null = null;
+let pollStartTime: number = 0;
+
+export function stopSyncPolling() {
+  if (syncPollInterval) {
+    clearInterval(syncPollInterval);
+    syncPollInterval = null;
+  }
+}
+
+export function startSyncPolling(jobId: string, productId: string | number, region: string) {
+  stopSyncPolling();
+  pollStartTime = Date.now();
+
+  const poll = async () => {
+    // 2-minute safe timeout threshold: Prevent permanent loading states
+    if (Date.now() - pollStartTime > 120_000) {
+      stopSyncPolling();
+      useProductDetailStore.setState({
+        syncStatus: "error",
+        syncStage: "FAILED",
+        syncProgress: 0,
+        syncError: "Sync execution timed out after 2 minutes. Please retry.",
+        syncMessage: null,
+      });
+      return;
+    }
+
+    try {
+      const res = await fetch(
+        `/api/proxy/${region}/sync-status?jobId=${encodeURIComponent(jobId)}&productId=${encodeURIComponent(
+          productId
+        )}`
+      );
+      if (!res.ok) return;
+
+      const data = await res.json();
+      const status = data.status;
+      const stage = data.stage;
+      const progress = data.progress ?? 0;
+      const message = data.message || "";
+      const result = data.result || data.job?.result || null;
+      const errorMessage = data.errorMessage || data.job?.errorMessage || null;
+
+      if (status === "COMPLETED") {
+        stopSyncPolling();
+        const shopifyProductId =
+          result?.shopifyProductId || data.data?.[String(productId)]?.shopifyProductId || null;
+        const shopifyNumericId = shopifyProductId ? shopifyProductId.split("/").pop() : null;
+
+        useProductDetailStore.setState({
+          syncStatus: "success",
+          syncStage: "COMPLETED",
+          syncProgress: 100,
+          syncMessage: message || "Product sync completed successfully.",
+          syncError: null,
+          syncResult: result,
+          isSynced: true,
+          shopifyProductId,
+          shopifyNumericId,
+        });
+      } else if (status === "FAILED") {
+        stopSyncPolling();
+        useProductDetailStore.setState({
+          syncStatus: "error",
+          syncStage: "FAILED",
+          syncProgress: 0,
+          syncError: errorMessage || message || "Product synchronization failed.",
+          syncMessage: null,
+        });
+      } else {
+        // IN_PROGRESS or QUEUED
+        useProductDetailStore.setState({
+          syncStatus: "loading",
+          syncStage: stage || "IN_PROGRESS",
+          syncProgress: Math.max(10, progress),
+          syncMessage: message || "Sync in progress...",
+        });
+      }
+    } catch (pollErr) {
+      console.warn("[useProductDetailStore] Sync polling transient error:", pollErr);
+    }
+  };
+
+  poll();
+  syncPollInterval = setInterval(poll, 2000);
+}
 
 export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
   product: null,
@@ -82,6 +173,10 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
 
   syncStatus: "idle",
   syncError: null,
+  syncJobId: null,
+  syncStage: null,
+  syncProgress: 0,
+  syncMessage: null,
   syncResult: null,
 
   isSynced: false,
@@ -225,10 +320,25 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
   checkSyncStatus: async (productId: string | number) => {
     const region = useRegionStore.getState().currentRegion;
     try {
-      const res = await fetch(`/api/proxy/${region}/sync-status?codes=${productId}`);
+      const res = await fetch(`/api/proxy/${region}/sync-status?productId=${productId}`);
       if (!res.ok) return;
       const json = await res.json();
       const statusData = json.data?.[String(productId)];
+
+      // Check if an active background sync job is currently running
+      if (json.jobId && (json.status === "IN_PROGRESS" || json.status === "QUEUED")) {
+        set({
+          syncStatus: "loading",
+          syncJobId: json.jobId,
+          syncStage: json.stage,
+          syncProgress: json.progress || 15,
+          syncMessage: json.message,
+          shopifyShop: json.shop || null,
+        });
+        startSyncPolling(json.jobId, productId, region);
+        return;
+      }
+
       if (statusData && statusData.isSynced) {
         set({
           isSynced: true,
@@ -267,7 +377,13 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
     }
 
     const region = useRegionStore.getState().currentRegion;
-    set({ syncStatus: "loading", syncError: null });
+    set({
+      syncStatus: "loading",
+      syncError: null,
+      syncStage: "QUEUED",
+      syncProgress: 5,
+      syncMessage: "Initiating background sync job...",
+    });
 
     try {
       const res = await fetch(`/api/proxy/${region}/sync-product`, {
@@ -291,26 +407,28 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
 
       const data = await res.json();
       if (!res.ok || !data.success) {
-        throw new Error(data.error || `Sync failed with HTTP ${res.status}`);
+        throw new Error(data.error || `Sync initiation failed with HTTP ${res.status}`);
       }
 
-      const shopifyProductId = data.data?.shopifyProductId || null;
-      const shopifyNumericId = shopifyProductId ? shopifyProductId.split("/").pop() : null;
-
+      const jobId = data.jobId;
       set({
-        syncStatus: "success",
-        syncError: null,
-        syncResult: data.data,
-        isSynced: true,
-        shopifyProductId,
-        shopifyNumericId,
+        syncJobId: jobId,
+        syncStage: data.stage || "QUEUED",
+        syncProgress: data.progress || 10,
+        syncMessage: data.message || "Sync queued in background...",
       });
+
+      if (jobId) {
+        startSyncPolling(jobId, targetProduct.code, region);
+      }
+
       return true;
     } catch (err: unknown) {
       const msg = (err as Error)?.message || "Failed to sync product to Shopify";
       set({
         syncStatus: "error",
         syncError: msg,
+        syncProgress: 0,
       });
       return false;
     }
@@ -365,6 +483,7 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
   },
 
   clearProduct: () => {
+    stopSyncPolling();
     set({
       product: null,
       productStatus: "idle",
@@ -377,6 +496,10 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
       leadTimesError: null,
       syncStatus: "idle",
       syncError: null,
+      syncJobId: null,
+      syncStage: null,
+      syncProgress: 0,
+      syncMessage: null,
       syncResult: null,
       isSynced: false,
       shopifyProductId: null,

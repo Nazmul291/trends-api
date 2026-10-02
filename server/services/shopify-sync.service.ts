@@ -5,6 +5,20 @@ import { TrendsApiClient } from "../api-client/trends-client";
 import { getAppSettings } from "../settings/app-settings.service";
 import prisma from "../../app/db.server";
 
+export type SyncStage =
+  | "QUEUED"
+  | "STAGE_1_PRODUCT_VARIANTS"
+  | "STAGE_2_MEDIA_LINKING"
+  | "STAGE_3_INVENTORY_DISTRIBUTION"
+  | "COMPLETED"
+  | "FAILED";
+
+export interface SyncProgressUpdate {
+  stage: SyncStage;
+  progress: number;
+  message: string;
+}
+
 export interface SyncTrendProductOptions {
   admin?: {
     graphql: (query: string, options?: { variables?: Record<string, unknown> }) => Promise<Response>;
@@ -17,6 +31,7 @@ export interface SyncTrendProductOptions {
   inventorySyncMode?: "single" | "split_equal";
   targetLocationId?: string | null;
   splitLocationIds?: string[];
+  onProgress?: (update: SyncProgressUpdate) => Promise<void> | void;
 }
 
 export interface SyncTrendProductResult {
@@ -1615,6 +1630,16 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
         : []),
     ];
 
+    if (options.onProgress) {
+      await options.onProgress({
+        stage: "STAGE_1_PRODUCT_VARIANTS",
+        progress: 25,
+        message: !shopifyProductId
+          ? "Creating product and provisioning variant matrix in Shopify..."
+          : "Updating product details and synchronizing variant matrix in Shopify...",
+      });
+    }
+
     if (!shopifyProductId) {
       // --- CREATE NEW PRODUCT ---
       const productInput: Record<string, unknown> = {
@@ -1744,24 +1769,6 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
               stockCode: normalizedSpecs[0].stockCode,
               quantity: normalizedSpecs[0].quantity,
             });
-
-            // Adjust inventory for single variant across configured locations
-            if (primaryLocationId && firstVariant.inventoryItem?.id) {
-              const allocations = allocateStockAcrossLocations(
-                normalizedSpecs[0].quantity,
-                effectiveMode,
-                effectiveTargetLocationId,
-                effectiveSplitLocationIds,
-                primaryLocationId
-              );
-              const itemsToSync: InventorySyncItem[] = allocations.map((alloc) => ({
-                inventoryItemId: firstVariant.inventoryItem.id,
-                quantity: alloc.quantity,
-                locationId: alloc.locationId,
-                sku: normalizedSpecs[0].canonicalSku,
-              }));
-              await syncInventoryQuantities(admin, primaryLocationId, itemsToSync);
-            }
           } catch (varErr) {
             console.warn("[Shopify Sync] Single variant update skipped:", varErr);
             variantLedgerEntries.push({
@@ -1876,38 +1883,6 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
             stockCode: spec.stockCode,
             quantity: spec.quantity,
           });
-        }
-
-        // Multi-location inventory adjustment for bulk variants (ALL variants synced in 1 batched call)
-        if (primaryLocationId && allCreatedVariants.length > 0) {
-          const inventoryItemsToSync: InventorySyncItem[] = [];
-          for (let i = 0; i < normalizedSpecs.length; i++) {
-            const spec = normalizedSpecs[i];
-            const matched =
-              allCreatedVariants.find((cv: any) => cv.inventoryItem?.sku === spec.canonicalSku) ||
-              allCreatedVariants[i];
-            if (matched?.inventoryItem?.id) {
-              const allocations = allocateStockAcrossLocations(
-                spec.quantity,
-                effectiveMode,
-                effectiveTargetLocationId,
-                effectiveSplitLocationIds,
-                primaryLocationId
-              );
-              for (const alloc of allocations) {
-                inventoryItemsToSync.push({
-                  inventoryItemId: matched.inventoryItem.id,
-                  quantity: alloc.quantity,
-                  locationId: alloc.locationId,
-                  sku: spec.canonicalSku,
-                });
-              }
-            }
-          }
-
-          if (inventoryItemsToSync.length > 0) {
-            await syncInventoryQuantities(admin, primaryLocationId, inventoryItemsToSync);
-          }
         }
       }
     } else {
@@ -2135,48 +2110,24 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
             }
           }
         }
-
-        // 3. Synchronize inventory quantities for ALL variants across configured locations in 1 batched call
-        if (primaryLocationId && !syncLocks.includes("inventory")) {
-          const inventoryItemsToUpdate: InventorySyncItem[] = [];
-
-          for (const vEntry of variantLedgerEntries) {
-            if (vEntry.inventoryItemId) {
-              const spec = normalizedSpecs.find((s) => s.stockCode === vEntry.stockCode);
-              const qty = spec?.quantity ?? vEntry.quantity ?? 0;
-              const allocations = allocateStockAcrossLocations(
-                qty,
-                effectiveMode,
-                effectiveTargetLocationId,
-                effectiveSplitLocationIds,
-                primaryLocationId
-              );
-              for (const alloc of allocations) {
-                inventoryItemsToUpdate.push({
-                  inventoryItemId: vEntry.inventoryItemId,
-                  quantity: alloc.quantity,
-                  locationId: alloc.locationId,
-                  sku: spec?.canonicalSku || vEntry.stockCode,
-                });
-              }
-            }
-          }
-
-          if (inventoryItemsToUpdate.length > 0) {
-            await syncInventoryQuantities(admin, primaryLocationId, inventoryItemsToUpdate);
-          }
-        }
       } catch (varUpdateErr) {
         console.warn("[Shopify Sync] Could not refresh existing variants:", varUpdateErr);
       }
     }
 
-    // --- VARIANT MEDIA & IMAGE ATTACHMENT PIPELINE ---
+    // --- STAGE 2: VARIANT MEDIA & IMAGE ATTACHMENT PIPELINE ---
     if (
       shopifyProductId &&
       trendsProduct.images &&
       trendsProduct.images.length > 0
     ) {
+      if (options.onProgress) {
+        await options.onProgress({
+          stage: "STAGE_2_MEDIA_LINKING",
+          progress: 60,
+          message: "Staging high-resolution product media and linking variant images...",
+        });
+      }
       try {
         const variantImageExtraction = extractVariantImageMappings(trendsProduct, normalizedSpecs);
         const mediaResult = await syncProductMedia(
@@ -2196,6 +2147,44 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
         );
       } catch (mediaPipelineErr) {
         console.warn("[Shopify Sync] Variant media pipeline warning (non-fatal):", mediaPipelineErr);
+      }
+    }
+
+    // --- STAGE 3: INVENTORY LOCATION DISTRIBUTION ---
+    if (primaryLocationId && !syncLocks.includes("inventory")) {
+      if (options.onProgress) {
+        await options.onProgress({
+          stage: "STAGE_3_INVENTORY_DISTRIBUTION",
+          progress: 85,
+          message: "Distributing variant stock across configured Shopify inventory locations...",
+        });
+      }
+      const inventoryItemsToUpdate: InventorySyncItem[] = [];
+
+      for (const vEntry of variantLedgerEntries) {
+        if (vEntry.inventoryItemId) {
+          const spec = normalizedSpecs.find((s) => s.stockCode === vEntry.stockCode);
+          const qty = spec?.quantity ?? vEntry.quantity ?? 0;
+          const allocations = allocateStockAcrossLocations(
+            qty,
+            effectiveMode,
+            effectiveTargetLocationId,
+            effectiveSplitLocationIds,
+            primaryLocationId
+          );
+          for (const alloc of allocations) {
+            inventoryItemsToUpdate.push({
+              inventoryItemId: vEntry.inventoryItemId,
+              quantity: alloc.quantity,
+              locationId: alloc.locationId,
+              sku: spec?.canonicalSku || vEntry.stockCode,
+            });
+          }
+        }
+      }
+
+      if (inventoryItemsToUpdate.length > 0) {
+        await syncInventoryQuantities(admin, primaryLocationId, inventoryItemsToUpdate);
       }
     }
   }
@@ -2265,6 +2254,14 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
         region: normalizedRegion,
         lastStockQty: vEntry.quantity,
       },
+    });
+  }
+
+  if (options.onProgress) {
+    await options.onProgress({
+      stage: "COMPLETED",
+      progress: 100,
+      message: `Product ${trendsCode} successfully ${action} in Shopify (${skuList.length} variants synced).`,
     });
   }
 

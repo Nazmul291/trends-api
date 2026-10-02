@@ -241,6 +241,9 @@ export default function ProductDetailPage() {
 
   const syncStatus = useProductDetailStore((s) => s.syncStatus);
   const syncError = useProductDetailStore((s) => s.syncError);
+  const syncStage = useProductDetailStore((s) => s.syncStage);
+  const syncProgress = useProductDetailStore((s) => s.syncProgress);
+  const syncMessage = useProductDetailStore((s) => s.syncMessage);
   const syncResult = useProductDetailStore((s) => s.syncResult);
   const syncProductToShopify = useProductDetailStore((s) => s.syncProductToShopify);
 
@@ -501,6 +504,85 @@ export default function ProductDetailPage() {
           )}
         </div>
       </div>
+
+      {/* Non-Blocking Background Sync Progress Banner */}
+      {syncStatus === "loading" && (
+        <div
+          style={{
+            backgroundColor: "#eff6ff",
+            border: "1px solid #bfdbfe",
+            borderRadius: "10px",
+            padding: "16px 20px",
+            boxShadow: "0 1px 3px rgba(0,0,0,0.04)",
+            display: "flex",
+            flexDirection: "column",
+            gap: "10px",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <span
+                style={{
+                  width: "16px",
+                  height: "16px",
+                  border: "2.5px solid #2563eb",
+                  borderTopColor: "transparent",
+                  borderRadius: "50%",
+                  display: "inline-block",
+                  animation: "trends-spin 0.6s linear infinite",
+                }}
+              />
+              <span style={{ fontSize: "14px", fontWeight: 700, color: "#1e40af" }}>
+                Background Sync in Progress ({syncProgress}%)
+              </span>
+            </div>
+            <span
+              style={{
+                fontSize: "11px",
+                fontWeight: 600,
+                color: "#1d4ed8",
+                backgroundColor: "#dbeafe",
+                padding: "3px 10px",
+                borderRadius: "12px",
+                letterSpacing: "0.4px",
+              }}
+            >
+              {syncStage === "STAGE_1_PRODUCT_VARIANTS"
+                ? "Stage 1: Product & Variants"
+                : syncStage === "STAGE_2_MEDIA_LINKING"
+                ? "Stage 2: Media & Images"
+                : syncStage === "STAGE_3_INVENTORY_DISTRIBUTION"
+                ? "Stage 3: Location Inventory"
+                : syncStage || "Processing"}
+            </span>
+          </div>
+
+          {/* Progress bar */}
+          <div
+            style={{
+              width: "100%",
+              height: "6px",
+              backgroundColor: "#dbeafe",
+              borderRadius: "4px",
+              overflow: "hidden",
+            }}
+          >
+            <div
+              style={{
+                width: `${Math.max(5, syncProgress)}%`,
+                height: "100%",
+                backgroundColor: "#2563eb",
+                transition: "width 0.4s ease-in-out",
+                borderRadius: "4px",
+              }}
+            />
+          </div>
+
+          <div style={{ fontSize: "12px", color: "#3b82f6" }}>
+            {syncMessage || "Processing catalog synchronization in background..."} — You can freely browse or edit other products.
+          </div>
+        </div>
+      )}
 
       {/* Sync Status Banner */}
       {syncStatus === "success" && syncResult && (

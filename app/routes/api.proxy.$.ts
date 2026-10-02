@@ -8,6 +8,11 @@ import {
   deleteTrendProductFromShopify,
   getTrendProductSyncStatuses,
 } from "../../server/services/shopify-sync.service";
+import {
+  createSyncJob,
+  getSyncJobStatus,
+  executeSyncJobAsync,
+} from "../../server/services/sync-job.service";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getAppSettings } from "../../server/settings/app-settings.service";
@@ -105,9 +110,42 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     );
   }
 
-  // Handle Sync Status Ledger Lookup
+  // Handle Sync Status Ledger Lookup or Async Job Polling
   if (endpoint === "sync-status" || endpoint.startsWith("sync-status")) {
+    const jobId = url.searchParams.get("jobId");
+    const productId = url.searchParams.get("productId") || url.searchParams.get("code");
     const codesParam = url.searchParams.get("codes");
+
+    // If polling for a specific background sync job
+    if (jobId || (productId && !codesParam)) {
+      const jobStatus = await getSyncJobStatus(shop, {
+        jobId: jobId || undefined,
+        productId: productId || undefined,
+      });
+
+      // Also get sync status item from ledger if productId provided
+      let syncItem = null;
+      if (productId) {
+        const syncMap = await getTrendProductSyncStatuses(shop, [String(productId)]);
+        syncItem = syncMap[String(productId)] || null;
+      }
+
+      return Response.json({
+        success: true,
+        region,
+        shop,
+        jobId: jobStatus?.id || jobId || null,
+        status: jobStatus?.status || (syncItem?.isSynced ? "COMPLETED" : "IDLE"),
+        stage: jobStatus?.stage || (syncItem?.isSynced ? "COMPLETED" : "IDLE"),
+        progress: jobStatus?.progress ?? (syncItem?.isSynced ? 100 : 0),
+        message: jobStatus?.message || null,
+        errorMessage: jobStatus?.errorMessage || null,
+        result: jobStatus?.result || null,
+        job: jobStatus,
+        data: syncItem && productId ? { [String(productId)]: syncItem } : {},
+      });
+    }
+
     const codes = codesParam ? codesParam.split(",").map((c) => c.trim()).filter(Boolean) : [];
     const syncMap = await getTrendProductSyncStatuses(shop, codes);
     return Response.json({
@@ -243,7 +281,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   }
 };
 
-export const action = async ({ request, params }: ActionFunctionArgs) => {
+export const action = async ({ request, params, context }: ActionFunctionArgs) => {
   let adminClient: any = undefined;
   let shop = "demo.myshopify.com";
 
@@ -321,7 +359,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     }
   }
 
-  // Handle Shopify Catalog Product Synchronization
+  // Handle Shopify Catalog Product Synchronization (Decoupled Background Worker)
   if (endpoint === "sync-product") {
     try {
       const body = (await request.json().catch(() => ({}))) as {
@@ -339,46 +377,100 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       if (Array.isArray(productToSync)) {
         productToSync = productToSync[0];
       }
-      if (!productToSync && body.productId) {
-        const showRes = await TrendsApiClient.request<ProductShowData>(region, `products/${body.productId}`, { settings: appSettings });
-        const rawShow = showRes.data?.data;
-        productToSync = Array.isArray(rawShow) ? rawShow[0] : rawShow;
-      }
 
-      if (!productToSync) {
+      const trendsCode = String(body.productId || productToSync?.code || "").trim();
+      if (!trendsCode) {
         return Response.json(
           { success: false, error: "Missing product data or productId for synchronization" },
           { status: 400 }
         );
       }
 
-      const syncResult = await syncTrendProductToShopify({
-        admin: adminClient,
-        shop,
-        trendsProduct: productToSync,
-        region,
-        syncLocks: body.syncLocks,
-        isMock: body.isMock,
-        inventorySyncMode: body.inventorySyncMode,
-        targetLocationId: body.targetLocationId,
-        splitLocationIds: body.splitLocationIds,
-      });
+      // 1. Initialize background sync job in PostgreSQL immediately
+      const job = await createSyncJob(shop, trendsCode, region);
 
-      return Response.json({
-        success: true,
-        region,
-        cached: false,
-        timestamp: new Date().toISOString(),
-        data: syncResult,
-      });
+      // 2. Launch background execution without blocking the HTTP response
+      const workerPromise = (async () => {
+        try {
+          let fullProduct = productToSync;
+          if (!fullProduct) {
+            try {
+              const showRes = await TrendsApiClient.request<ProductShowData>(
+                region,
+                `products/${trendsCode}`,
+                { settings: appSettings }
+              );
+              const rawShow = showRes.data?.data;
+              fullProduct = Array.isArray(rawShow) ? rawShow[0] : rawShow;
+            } catch (fetchErr) {
+              console.warn(
+                `[ProxyAction] Could not pre-fetch product ${trendsCode} in background:`,
+                fetchErr
+              );
+            }
+          }
+
+          if (!fullProduct) {
+            fullProduct = {
+              code: trendsCode,
+              name: `Product ${trendsCode}`,
+              description: "",
+              categories: [],
+              images: [],
+              stock: [],
+              pricing: [],
+            } as ProductData;
+          }
+
+          await executeSyncJobAsync(job.id, {
+            shop,
+            trendsCode,
+            region,
+            admin: adminClient,
+            productToSync: fullProduct,
+            syncLocks: body.syncLocks,
+            isMock: body.isMock,
+            inventorySyncMode: body.inventorySyncMode,
+            targetLocationId: body.targetLocationId,
+            splitLocationIds: body.splitLocationIds,
+          });
+        } catch (workerErr) {
+          console.error(`[ProxyAction] Background worker error for job ${job.id}:`, workerErr);
+        }
+      })();
+
+      // Support Vercel / serverless waitUntil if provided by the environment
+      if (context && typeof (context as any).waitUntil === "function") {
+        (context as any).waitUntil(workerPromise);
+      }
+
+      // 3. Return immediate HTTP 202 Accepted (< 500ms) with job ID
+      return Response.json(
+        {
+          success: true,
+          jobId: job.id,
+          productId: trendsCode,
+          trendsCode,
+          status: "QUEUED",
+          stage: "QUEUED",
+          progress: 5,
+          message: "Product synchronization job initiated successfully in the background.",
+          region,
+          timestamp: new Date().toISOString(),
+        },
+        {
+          status: 202,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        }
+      );
     } catch (syncErr: unknown) {
-      const message = syncErr instanceof Error ? syncErr.message : "Sync to Shopify failed";
+      const message = syncErr instanceof Error ? syncErr.message : "Sync to Shopify failed to initialize";
       return Response.json(
         {
           success: false,
           region,
-          cached: false,
-          timestamp: new Date().toISOString(),
           error: message,
         },
         { status: 500 }
