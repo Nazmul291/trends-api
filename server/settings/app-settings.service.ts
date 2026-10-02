@@ -36,6 +36,11 @@ export interface AppSettingsData {
   inventorySyncMode: "single" | "split_equal";
   targetLocationId: string | null;
   splitLocationIds: string[];
+  // Stateful Chunk Cursor for Vercel Cron
+  currentSyncPage: number;
+  totalCatalogPages: number;
+  syncCursorStatus: "idle" | "in_progress" | "completed" | string;
+  lastChunkProcessedAt: Date | string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +123,10 @@ function getEnvFallback(): AppSettingsData {
     inventorySyncMode: "single",
     targetLocationId: null,
     splitLocationIds: [],
+    currentSyncPage: 1,
+    totalCatalogPages: 1,
+    syncCursorStatus: "idle",
+    lastChunkProcessedAt: null,
   };
 }
 
@@ -153,6 +162,10 @@ export async function getAppSettings(shop: string): Promise<AppSettingsData> {
         inventorySyncMode: normalizeInventorySyncMode(record.inventorySyncMode),
         targetLocationId: record.targetLocationId || null,
         splitLocationIds: Array.isArray(record.splitLocationIds) ? record.splitLocationIds : [],
+        currentSyncPage: record.currentSyncPage ?? 1,
+        totalCatalogPages: record.totalCatalogPages ?? 1,
+        syncCursorStatus: record.syncCursorStatus || "idle",
+        lastChunkProcessedAt: record.lastChunkProcessedAt || null,
       };
       setCache(shop, data);
       return data;
@@ -205,6 +218,10 @@ export async function saveAppSettings(
       inventorySyncMode: rawMode !== undefined ? normalizeInventorySyncMode(rawMode) : "single",
       targetLocationId: rawTargetLoc !== undefined ? rawTargetLoc : null,
       splitLocationIds: Array.isArray(rawSplitLocs) ? rawSplitLocs : [],
+      currentSyncPage: settings.currentSyncPage !== undefined ? Number(settings.currentSyncPage) : 1,
+      totalCatalogPages: settings.totalCatalogPages !== undefined ? Number(settings.totalCatalogPages) : 1,
+      syncCursorStatus: settings.syncCursorStatus || "idle",
+      lastChunkProcessedAt: settings.lastChunkProcessedAt ?? null,
     },
     update: {
       ...(settings.trendsApiKey !== undefined && { trendsApiKey: settings.trendsApiKey }),
@@ -223,6 +240,10 @@ export async function saveAppSettings(
       ...(rawMode !== undefined && { inventorySyncMode: normalizeInventorySyncMode(rawMode) }),
       ...(rawTargetLoc !== undefined && { targetLocationId: rawTargetLoc }),
       ...(rawSplitLocs !== undefined && { splitLocationIds: Array.isArray(rawSplitLocs) ? rawSplitLocs : [] }),
+      ...(settings.currentSyncPage !== undefined && { currentSyncPage: Number(settings.currentSyncPage) }),
+      ...(settings.totalCatalogPages !== undefined && { totalCatalogPages: Number(settings.totalCatalogPages) }),
+      ...(settings.syncCursorStatus !== undefined && { syncCursorStatus: settings.syncCursorStatus }),
+      ...(settings.lastChunkProcessedAt !== undefined && { lastChunkProcessedAt: settings.lastChunkProcessedAt }),
     },
   });
 
@@ -241,6 +262,10 @@ export async function saveAppSettings(
     inventorySyncMode: normalizeInventorySyncMode(record.inventorySyncMode),
     targetLocationId: record.targetLocationId || null,
     splitLocationIds: Array.isArray(record.splitLocationIds) ? record.splitLocationIds : [],
+    currentSyncPage: record.currentSyncPage ?? 1,
+    totalCatalogPages: record.totalCatalogPages ?? 1,
+    syncCursorStatus: record.syncCursorStatus || "idle",
+    lastChunkProcessedAt: record.lastChunkProcessedAt || null,
   };
 
   // Bust cache so next read is fresh

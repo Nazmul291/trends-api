@@ -12,6 +12,10 @@ import {
   triggerManualSync,
   getSchedulerStatus,
 } from "../../server/services/sync-scheduler.server";
+import {
+  processSyncChunk,
+  resetSyncCursor,
+} from "../../server/services/chunk-sync.service";
 import { buildCronExpression } from "../../shared/utils/cron";
 import type { Region } from "../../shared/types/trends.types";
 import { ALL_REGIONS } from "../../shared/types/trends.types";
@@ -89,6 +93,12 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     syncErrorMessage: settings.syncErrorMessage,
     isScheduled: schedulerStatus.isScheduled,
     cronExpression: schedulerStatus.cronExpression,
+    currentSyncPage: settings.currentSyncPage ?? 1,
+    totalCatalogPages: settings.totalCatalogPages ?? 1,
+    syncCursorStatus: settings.syncCursorStatus ?? "idle",
+    lastChunkProcessedAt: settings.lastChunkProcessedAt
+      ? new Date(settings.lastChunkProcessedAt).toISOString()
+      : null,
   };
 };
 
@@ -103,7 +113,47 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const formData = await request.formData();
   const actionType = formData.get("actionType");
 
-  // 1. Manual One-Off Immediate Sync Trigger
+  // 1a. Run Single Sync Chunk Immediately (Safe Vercel Serverless Batch)
+  if (actionType === "runSyncChunk") {
+    try {
+      const result = await processSyncChunk(shop, { isManual: true });
+      return {
+        success: result.success,
+        actionType: "runSyncChunk",
+        message: result.message,
+        error: result.error || null,
+        chunkResult: result,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        actionType: "runSyncChunk",
+        message: null,
+        error: err instanceof Error ? err.message : "Sync chunk execution failed.",
+      };
+    }
+  }
+
+  // 1b. Reset Sync Cursor to Page 1
+  if (actionType === "resetSyncCursor") {
+    try {
+      await resetSyncCursor(shop);
+      return {
+        success: true,
+        actionType: "resetSyncCursor",
+        message: "Sync cursor successfully reset to Page 1.",
+      };
+    } catch (err) {
+      return {
+        success: false,
+        actionType: "resetSyncCursor",
+        message: null,
+        error: err instanceof Error ? err.message : "Failed to reset cursor.",
+      };
+    }
+  }
+
+  // 1c. Manual Full Sync Trigger
   if (actionType === "syncNow") {
     try {
       const result = await triggerManualSync(shop);
@@ -240,6 +290,10 @@ export default function SettingsPage() {
     syncStatus,
     syncErrorMessage,
     cronExpression,
+    currentSyncPage,
+    totalCatalogPages,
+    syncCursorStatus,
+    lastChunkProcessedAt,
   } = useLoaderData<typeof loader>();
 
   const actionData = useActionData<typeof action>();
@@ -317,6 +371,10 @@ export default function SettingsPage() {
   const hasSaveError = actionData?.success === false && actionData?.actionType === "saveSettings";
   const hasSyncNowSuccess = actionData?.success === true && actionData?.actionType === "syncNow";
   const hasSyncNowError = actionData?.success === false && actionData?.actionType === "syncNow";
+  const hasChunkSuccess = actionData?.success === true && actionData?.actionType === "runSyncChunk";
+  const hasChunkError = actionData?.success === false && actionData?.actionType === "runSyncChunk";
+  const hasResetSuccess = actionData?.success === true && actionData?.actionType === "resetSyncCursor";
+  const hasResetError = actionData?.success === false && actionData?.actionType === "resetSyncCursor";
 
   // Re-synchronize baseline immediately upon successful save action
   useEffect(() => {
@@ -554,6 +612,86 @@ export default function SettingsPage() {
         </div>
       )}
 
+      {hasChunkSuccess && (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "10px",
+            padding: "14px 18px",
+            backgroundColor: "#f0fdf4",
+            border: "1px solid #16a34a",
+            borderRadius: "10px",
+            color: "#166534",
+            fontSize: "13px",
+            fontWeight: 500,
+          }}
+        >
+          <span style={{ fontSize: "18px" }}>⚡</span>
+          {actionData?.message || "Sync chunk processed successfully."}
+        </div>
+      )}
+
+      {hasChunkError && (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "10px",
+            padding: "14px 18px",
+            backgroundColor: "#fff4f4",
+            border: "1px solid #d82c0d",
+            borderRadius: "10px",
+            color: "#7c1c0a",
+            fontSize: "13px",
+            fontWeight: 500,
+          }}
+        >
+          <span style={{ fontSize: "18px" }}>❌</span>
+          {actionData?.error || "Sync chunk execution failed."}
+        </div>
+      )}
+
+      {hasResetSuccess && (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "10px",
+            padding: "14px 18px",
+            backgroundColor: "#eff6ff",
+            border: "1px solid #3b82f6",
+            borderRadius: "10px",
+            color: "#1e40af",
+            fontSize: "13px",
+            fontWeight: 500,
+          }}
+        >
+          <span style={{ fontSize: "18px" }}>🔄</span>
+          {actionData?.message || "Sync cursor reset to Page 1."}
+        </div>
+      )}
+
+      {hasResetError && (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "10px",
+            padding: "14px 18px",
+            backgroundColor: "#fff4f4",
+            border: "1px solid #d82c0d",
+            borderRadius: "10px",
+            color: "#7c1c0a",
+            fontSize: "13px",
+            fontWeight: 500,
+          }}
+        >
+          <span style={{ fontSize: "18px" }}>❌</span>
+          {actionData?.error || "Failed to reset cursor."}
+        </div>
+      )}
+
       {/* ----------------------------------------------------------------- */}
       {/* SECTION 1: Automated Background Sync Card                        */}
       {/* ----------------------------------------------------------------- */}
@@ -763,6 +901,202 @@ export default function SettingsPage() {
             <strong>Last Error:</strong> {syncErrorMessage}
           </div>
         )}
+
+        {/* Stateful Vercel Cron Chunk Cursor Panel */}
+        <div
+          style={{
+            backgroundColor: "#f8fafc",
+            border: "1px solid #cbd5e1",
+            borderRadius: "10px",
+            padding: "16px 20px",
+            marginBottom: "20px",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              flexWrap: "wrap",
+              gap: "12px",
+              marginBottom: "12px",
+            }}
+          >
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <span style={{ fontSize: "14px", fontWeight: 700, color: "#0f172a" }}>
+                  Serverless Chunk Sync Cursor
+                </span>
+                <span
+                  style={{
+                    fontSize: "11px",
+                    fontWeight: 700,
+                    textTransform: "uppercase",
+                    letterSpacing: "0.5px",
+                    padding: "2px 8px",
+                    borderRadius: "12px",
+                    backgroundColor:
+                      syncCursorStatus === "completed"
+                        ? "#dcfce7"
+                        : syncCursorStatus === "in_progress"
+                        ? "#e0e7ff"
+                        : "#f1f5f9",
+                    color:
+                      syncCursorStatus === "completed"
+                        ? "#15803d"
+                        : syncCursorStatus === "in_progress"
+                        ? "#4338ca"
+                        : "#475569",
+                    border: `1px solid ${
+                      syncCursorStatus === "completed"
+                        ? "#86efac"
+                        : syncCursorStatus === "in_progress"
+                        ? "#c7d2fe"
+                        : "#cbd5e1"
+                    }`,
+                  }}
+                >
+                  {syncCursorStatus === "completed"
+                    ? "Cycle Completed"
+                    : syncCursorStatus === "in_progress"
+                    ? "In Progress"
+                    : "Idle"}
+                </span>
+              </div>
+              <p style={{ margin: "3px 0 0 0", fontSize: "12px", color: "#64748b" }}>
+                Vercel Cron processes a safe 12-item slice per invocation to eliminate serverless timeouts.
+              </p>
+            </div>
+
+            {/* Manual Controls */}
+            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <Form method="post">
+                <input type="hidden" name="actionType" value="runSyncChunk" />
+                <button
+                  type="submit"
+                  disabled={isSubmitting || syncStatus === "running"}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    padding: "6px 14px",
+                    fontSize: "12px",
+                    fontWeight: 600,
+                    color: "#0f766e",
+                    backgroundColor: "#ccfbf1",
+                    border: "1px solid #99f6e4",
+                    borderRadius: "6px",
+                    cursor: isSubmitting || syncStatus === "running" ? "not-allowed" : "pointer",
+                    transition: "all 0.15s ease",
+                  }}
+                  title="Execute a single safe 12-item batch immediately and advance cursor"
+                >
+                  <span>⚡</span> Run Chunk Now
+                </button>
+              </Form>
+
+              <Form method="post">
+                <input type="hidden" name="actionType" value="resetSyncCursor" />
+                <button
+                  type="submit"
+                  disabled={isSubmitting || syncStatus === "running"}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    padding: "6px 14px",
+                    fontSize: "12px",
+                    fontWeight: 600,
+                    color: "#475569",
+                    backgroundColor: "#ffffff",
+                    border: "1px solid #cbd5e1",
+                    borderRadius: "6px",
+                    cursor: isSubmitting || syncStatus === "running" ? "not-allowed" : "pointer",
+                    transition: "all 0.15s ease",
+                  }}
+                  title="Reset cursor pagination back to page 1"
+                >
+                  <span>🔄</span> Reset Cursor
+                </button>
+              </Form>
+            </div>
+          </div>
+
+          {/* Progress Bar & Details */}
+          <div style={{ marginTop: "10px" }}>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                fontSize: "12px",
+                color: "#334155",
+                marginBottom: "6px",
+              }}
+            >
+              <span>
+                Catalog Cursor: <strong>Page {currentSyncPage}</strong> of{" "}
+                <strong>{totalCatalogPages || 1}</strong>
+              </span>
+              <span>
+                Last Chunk Processed:{" "}
+                <strong>
+                  {lastChunkProcessedAt
+                    ? new Date(lastChunkProcessedAt).toLocaleTimeString([], {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                        second: "2-digit",
+                      }) +
+                      " on " +
+                      new Date(lastChunkProcessedAt).toLocaleDateString()
+                    : "Not yet run"}
+                </strong>
+              </span>
+            </div>
+
+            {/* Visual Bar */}
+            <div
+              style={{
+                width: "100%",
+                height: "6px",
+                backgroundColor: "#e2e8f0",
+                borderRadius: "3px",
+                overflow: "hidden",
+              }}
+            >
+              <div
+                style={{
+                  height: "100%",
+                  width: `${Math.min(
+                    100,
+                    Math.max(
+                      2,
+                      Math.round(
+                        ((currentSyncPage) / (totalCatalogPages || 1)) * 100
+                      )
+                    )
+                  )}%`,
+                  backgroundColor:
+                    syncCursorStatus === "completed" ? "#10b981" : "#3b82f6",
+                  borderRadius: "3px",
+                  transition: "width 0.3s ease",
+                }}
+              />
+            </div>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                fontSize: "11px",
+                color: "#94a3b8",
+                marginTop: "4px",
+              }}
+            >
+              <span>Endpoint: <code>/api/cron/sync-chunk</code></span>
+              <span>Vercel Cron: <code>*/10 * * * *</code></span>
+            </div>
+          </div>
+        </div>
 
         {/* Main Settings Form */}
         <Form method="post" noValidate>

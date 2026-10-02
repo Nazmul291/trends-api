@@ -108,6 +108,12 @@ model AppSettings {
   targetLocationId        String?
   splitLocationIds        String[] @default([])
 
+  // Stateful Chunk Cursor for Vercel Cron
+  currentSyncPage         Int      @default(1)
+  totalCatalogPages       Int      @default(1)
+  syncCursorStatus        String   @default("idle")
+  lastChunkProcessedAt    DateTime?
+
   createdAt               DateTime @default(now())
   updatedAt               DateTime @updatedAt
 }
