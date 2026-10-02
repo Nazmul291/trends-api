@@ -680,8 +680,8 @@ export async function syncInventoryQuantities(
 
         const actRes = await admin.graphql(
           `#graphql
-          mutation activateInventoryAtLocations($inventoryItemId: ID!, $locations: [InventoryBulkToggleActivationInput!]!) {
-            inventoryBulkToggleActivation(inventoryItemId: $inventoryItemId, locations: $locations) {
+          mutation activateInventoryAtLocations($inventoryItemId: ID!, $inventoryItemUpdates: [InventoryBulkToggleActivationInput!]!) {
+            inventoryBulkToggleActivation(inventoryItemId: $inventoryItemId, inventoryItemUpdates: $inventoryItemUpdates) {
               inventoryItem {
                 id
               }
@@ -694,7 +694,7 @@ export async function syncInventoryQuantities(
           {
             variables: {
               inventoryItemId: invId,
-              locations: locationsToActivate,
+              inventoryItemUpdates: locationsToActivate,
             },
           }
         );
@@ -793,8 +793,8 @@ export async function syncInventoryQuantities(
           if (!alreadyActive) {
             const actRes = await admin.graphql(
               `#graphql
-              mutation retryLocationActivation($inventoryItemId: ID!, $locations: [InventoryBulkToggleActivationInput!]!) {
-                inventoryBulkToggleActivation(inventoryItemId: $inventoryItemId, locations: $locations) {
+              mutation retryLocationActivation($inventoryItemId: ID!, $inventoryItemUpdates: [InventoryBulkToggleActivationInput!]!) {
+                inventoryBulkToggleActivation(inventoryItemId: $inventoryItemId, inventoryItemUpdates: $inventoryItemUpdates) {
                   inventoryItem {
                     id
                   }
@@ -807,7 +807,7 @@ export async function syncInventoryQuantities(
               {
                 variables: {
                   inventoryItemId: item.inventoryItemId,
-                  locations: [{ locationId: validLocId, activate: true }],
+                  inventoryItemUpdates: [{ locationId: validLocId, activate: true }],
                 },
               }
             );
@@ -889,8 +889,8 @@ export async function syncInventoryQuantities(
         if (!isAlreadyActive) {
           const actRes = await admin.graphql(
             `#graphql
-            mutation fallbackLocationActivation($inventoryItemId: ID!, $locations: [InventoryBulkToggleActivationInput!]!) {
-              inventoryBulkToggleActivation(inventoryItemId: $inventoryItemId, locations: $locations) {
+            mutation fallbackLocationActivation($inventoryItemId: ID!, $inventoryItemUpdates: [InventoryBulkToggleActivationInput!]!) {
+              inventoryBulkToggleActivation(inventoryItemId: $inventoryItemId, inventoryItemUpdates: $inventoryItemUpdates) {
                 inventoryItem {
                   id
                 }
@@ -903,7 +903,7 @@ export async function syncInventoryQuantities(
             {
               variables: {
                 inventoryItemId: item.inventoryItemId,
-                locations: [{ locationId: validLocId, activate: true }],
+                inventoryItemUpdates: [{ locationId: validLocId, activate: true }],
               },
             }
           );
