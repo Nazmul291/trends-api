@@ -1601,6 +1601,15 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
 
   let shopifyProductId = existingSync?.shopifyProductId;
   let shopifyHandle: string | undefined;
+
+  console.info(
+    `[Shopify Sync Diagnostic] trends code ${trendsCode}: DB lookup ${
+      existingSync ? `found row id=${existingSync.id}` : "found no row"
+    } for shop ${shop}. shopifyProductId=${JSON.stringify(shopifyProductId)}, ` +
+      `isValidGid=${isValidShopifyProductGid(shopifyProductId)}, ` +
+      `variantsInLedger=${existingSync?.variants?.length ?? 0}`
+  );
+
   // Whether this call actually ran productCreate (vs. finding/updating an
   // existing Shopify product) — used for the final "created"/"updated" label,
   // since `existingSync` alone can't tell (a self-healed placeholder row has
@@ -1652,6 +1661,11 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
     try {
       const stockRes = await TrendsApiClient.request<any>(normalizedRegion, `stock/${trendsCode}`);
       const extractedStock = parseTrendsStockResponse(stockRes?.data);
+      console.info(
+        `[Shopify Sync Diagnostic] trends code ${trendsCode}: live stock/{code} endpoint returned ` +
+          `${Array.isArray(stockRes?.data) ? stockRes.data.length : typeof stockRes?.data} raw item(s), ` +
+          `parsed to ${extractedStock.length} stock item(s).`
+      );
       if (extractedStock.length > 0) {
         trendsProduct = {
           ...trendsProduct,
@@ -1672,6 +1686,11 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
   // 3. Extract base price & variant specifications with isolated per-variant fault handling
   const primaryPrice = extractBasePrice(trendsProduct, normalizedRegion);
   const { optionName, specs: rawSpecs } = buildVariantSpecs(trendsProduct, normalizedRegion, trendsCode);
+  console.info(
+    `[Shopify Sync Diagnostic] trends code ${trendsCode}: trendsProduct.stock has ` +
+      `${Array.isArray(trendsProduct.stock) ? trendsProduct.stock.length : 0} entries; ` +
+      `buildVariantSpecs produced ${rawSpecs.length} raw spec(s) under option "${optionName}".`
+  );
 
   const normalizedSpecs: VariantSpec[] = [];
   for (const rawSpec of rawSpecs) {
@@ -1709,6 +1728,13 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
       quantity: 0,
     });
   }
+
+  console.info(
+    `[Shopify Sync Diagnostic] trends code ${trendsCode}: ${rawSpecs.length} raw spec(s) -> ` +
+      `${normalizedSpecs.length} normalized spec(s) after per-item fault isolation. ` +
+      `Unique option values: ${new Set(normalizedSpecs.map((s) => s.optionValue)).size}. ` +
+      `Full option value list: ${JSON.stringify(normalizedSpecs.map((s) => s.optionValue))}`
+  );
 
   // Record the full canonicalized count before any chunk slicing below, so callers
   // (the sync-chunk fallback endpoint) can tell how many variants remain overall.
@@ -1882,6 +1908,14 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
         ],
       };
 
+      console.info(
+        `[Shopify Sync Diagnostic] trends code ${trendsCode}: productCreate declaring option "${optionName}" ` +
+          `with ${(productInput.productOptions as Array<{ values: unknown[] }>)[0].values.length} value(s). ` +
+          `Per Shopify's docs, productCreate auto-creates exactly ONE standalone variant (using the first ` +
+          `declared value) regardless of how many values are declared — the rest are added via ` +
+          `productVariantsBulkCreate below.`
+      );
+
       const createJson = await executeShopifyGraphql(
         admin,
         `#graphql
@@ -1922,9 +1956,15 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
       const createdProduct = createJson?.data?.productCreate?.product;
       const userErrors = createJson?.data?.productCreate?.userErrors || [];
 
+      console.info(
+        `[Shopify Sync Diagnostic] trends code ${trendsCode}: productCreate returned ` +
+          `${createdProduct?.variants?.nodes?.length ?? 0} standalone variant(s), ` +
+          `${userErrors.length} userError(s): ${JSON.stringify(userErrors)}`
+      );
+
       if (userErrors.length > 0 || !createdProduct?.id) {
         throw new Error(
-          `Shopify productCreate failed: ${userErrors.map((e: { message: string }) => e.message).join(", ")}`
+          `Shopify productCreate failed: ${JSON.stringify(userErrors)}`
         );
       }
 
@@ -2030,6 +2070,12 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
         const allCreatedVariants: any[] = [];
         const VARIANT_BATCH_SIZE = 50;
 
+        console.info(
+          `[Shopify Sync Diagnostic] trends code ${trendsCode}: about to bulk-create ` +
+            `${bulkVariantsInput.length} variant(s) for option "${optionName}". Sample optionValues ` +
+            `(first 5): ${JSON.stringify(bulkVariantsInput.slice(0, 5).map((v) => v.optionValues))}`
+        );
+
         for (let i = 0; i < bulkVariantsInput.length; i += VARIANT_BATCH_SIZE) {
           const chunk = bulkVariantsInput.slice(i, i + VARIANT_BATCH_SIZE);
           const isFirstChunk = i === 0;
@@ -2080,16 +2126,21 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
             allCreatedVariants.push(...createdChunkVariants);
 
             const bulkErrors = bulkJson?.data?.productVariantsBulkCreate?.userErrors || [];
-            if (bulkErrors.length > 0) {
-              console.warn(
-                `[Shopify Sync] productVariantsBulkCreate user errors on batch ${Math.floor(i / VARIANT_BATCH_SIZE) + 1}:`,
-                bulkErrors.map((e: { message: string }) => e.message).join(", ")
-              );
-            }
+            console.info(
+              `[Shopify Sync Diagnostic] trends code ${trendsCode}: batch ${Math.floor(i / VARIANT_BATCH_SIZE) + 1} ` +
+                `(strategy ${isFirstChunk ? "REMOVE_STANDALONE_VARIANT" : "DEFAULT"}) requested ${chunk.length}, ` +
+                `Shopify created ${createdChunkVariants.length}, ${bulkErrors.length} userError(s): ` +
+                `${JSON.stringify(bulkErrors)}`
+            );
           } catch (bulkErr) {
             console.warn(`[Shopify Sync] Bulk variant creation error on batch:`, bulkErr);
           }
         }
+
+        console.info(
+          `[Shopify Sync Diagnostic] trends code ${trendsCode}: total created across all batches = ` +
+            `${allCreatedVariants.length} of ${bulkVariantsInput.length} requested.`
+        );
 
         // Map each spec to created variant GID
         for (let i = 0; i < normalizedSpecs.length; i++) {
