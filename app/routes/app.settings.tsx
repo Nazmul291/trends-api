@@ -31,6 +31,141 @@ const REGION_META: Record<Region, { flag: string; label: string; currency: strin
 };
 
 // ---------------------------------------------------------------------------
+// Client-side: "Sync All" per-product orchestration
+// ---------------------------------------------------------------------------
+
+interface SyncTriggerResponse {
+  success: boolean;
+  error?: string;
+  mode?: "background" | "client_chunk";
+  jobId?: string;
+  totalVariants?: number;
+  chunkSize?: number;
+  productToSync?: unknown;
+  syncLocks?: string[];
+  isMock?: boolean;
+  inventorySyncMode?: "single" | "split_equal";
+  targetLocationId?: string | null;
+  splitLocationIds?: string[];
+}
+
+interface SyncChunkResponse {
+  success: boolean;
+  error?: string;
+  status?: string;
+  hasMore?: boolean;
+  nextOffset?: number | null;
+}
+
+/**
+ * Drives a single product's sync to completion, transparently handling either
+ * outcome of POST sync-product: QStash background dispatch (poll sync-status)
+ * or, if QStash is unavailable, the client-driven chunk fallback (loop
+ * sync-chunk). Used by the Settings page "Sync All" loop below, one product at
+ * a time, so the browser — not a single long-lived serverless invocation —
+ * coordinates the whole catalog resync.
+ */
+async function syncOneProductToCompletion(
+  trendsCode: string,
+  region: Region
+): Promise<{ success: boolean; error?: string }> {
+  let triggerData: SyncTriggerResponse;
+  try {
+    const res = await fetch(`/api/proxy/${region}/sync-product`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ productId: trendsCode, region }),
+    });
+    triggerData = await res.json();
+    if (!res.ok || !triggerData.success) {
+      return { success: false, error: triggerData.error || `Sync initiation failed (HTTP ${res.status})` };
+    }
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : "Failed to initiate sync" };
+  }
+
+  const jobId = triggerData.jobId;
+  if (!jobId) {
+    return { success: false, error: "Sync initiation did not return a jobId" };
+  }
+
+  if (triggerData.mode === "client_chunk") {
+    const chunkSize = triggerData.chunkSize || 10;
+    const productToSync = triggerData.productToSync;
+    let offset = 0;
+    // The initial `totalVariants` estimate can be stale (the sync pipeline
+    // re-fetches live stock on every call), so loop continuation is driven by
+    // each chunk response's own `hasMore`, never by a fixed count. This cap is
+    // only a safety net against an unexpected server-side loop.
+    const MAX_CHUNK_ITERATIONS = 500;
+
+    for (let iteration = 0; iteration < MAX_CHUNK_ITERATIONS; iteration++) {
+      let chunkData: SyncChunkResponse | null = null;
+      let lastErr: string | null = null;
+
+      for (let attempt = 0; attempt <= 2 && !chunkData; attempt++) {
+        try {
+          const res = await fetch(`/api/proxy/${region}/sync-chunk`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              jobId,
+              trendsCode,
+              productToSync,
+              offset,
+              limit: chunkSize,
+              syncLocks: triggerData.syncLocks,
+              isMock: triggerData.isMock,
+              inventorySyncMode: triggerData.inventorySyncMode,
+              targetLocationId: triggerData.targetLocationId,
+              splitLocationIds: triggerData.splitLocationIds,
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok || !data.success) {
+            throw new Error(data.error || `Chunk sync failed (HTTP ${res.status})`);
+          }
+          chunkData = data;
+        } catch (err) {
+          lastErr = err instanceof Error ? err.message : "Chunk sync request failed";
+          if (attempt < 2) await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+        }
+      }
+
+      if (!chunkData) {
+        return { success: false, error: lastErr || "Chunk sync failed after retries" };
+      }
+      if (chunkData.status === "COMPLETED" || !chunkData.hasMore) {
+        return { success: true };
+      }
+      offset = chunkData.nextOffset ?? offset + chunkSize;
+    }
+    return { success: false, error: "Chunk sync did not complete after an unexpectedly large number of chunks" };
+  }
+
+  // mode === "background": poll sync-status until COMPLETED/FAILED, same 2-minute
+  // ceiling used by the product-detail page's polling loop.
+  const pollStart = Date.now();
+  while (Date.now() - pollStart < 120_000) {
+    await new Promise((r) => setTimeout(r, 2000));
+    try {
+      const res = await fetch(
+        `/api/proxy/${region}/sync-status?jobId=${encodeURIComponent(jobId)}&productId=${encodeURIComponent(trendsCode)}`
+      );
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (data.status === "COMPLETED") return { success: true };
+      if (data.status === "FAILED") {
+        return { success: false, error: data.errorMessage || data.message || "Sync failed" };
+      }
+    } catch {
+      // transient poll error — keep retrying until the timeout above
+    }
+  }
+  return { success: false, error: "Sync timed out after 2 minutes" };
+}
+
+// ---------------------------------------------------------------------------
 // Server-side: Loader
 // ---------------------------------------------------------------------------
 
@@ -320,6 +455,71 @@ export default function SettingsPage() {
   );
   const [targetLocation, setTargetLocation] = useState<string>(initialTargetLocation || "");
   const [splitLocations, setSplitLocations] = useState<string[]>(initialSplitLocations || []);
+
+  // Browser-driven "Sync All" state. Separate from the automated cron chunker
+  // above: this walks the full catalog one product at a time from the browser,
+  // so progress and per-product failures are visible live instead of only via
+  // the cron's page-sized batch summary.
+  const [syncAllState, setSyncAllState] = useState<{
+    status: "idle" | "running" | "completed" | "error";
+    totalProducts: number;
+    currentIndex: number;
+    currentCode: string | null;
+    failedProducts: Array<{ code: string; error: string }>;
+  }>({
+    status: "idle",
+    totalProducts: 0,
+    currentIndex: 0,
+    currentCode: null,
+    failedProducts: [],
+  });
+
+  const syncAllRegion: Region = ((enabledRegions as Region[])[0] || "au") as Region;
+
+  const runSyncAll = async () => {
+    setSyncAllState({
+      status: "running",
+      totalProducts: 0,
+      currentIndex: 0,
+      currentCode: null,
+      failedProducts: [],
+    });
+
+    let productIds: string[] = [];
+    try {
+      const initRes = await fetch(`/api/proxy/${syncAllRegion}/sync-all-init`);
+      const initData = await initRes.json();
+      if (!initRes.ok || !initData.success) {
+        throw new Error(initData.error || "Failed to load product catalog");
+      }
+      productIds = initData.productIds || [];
+    } catch (err) {
+      setSyncAllState((prev) => ({
+        ...prev,
+        status: "error",
+        failedProducts: [
+          { code: "catalog", error: err instanceof Error ? err.message : "Failed to load catalog" },
+        ],
+      }));
+      return;
+    }
+
+    setSyncAllState((prev) => ({ ...prev, totalProducts: productIds.length }));
+
+    const failed: Array<{ code: string; error: string }> = [];
+    for (let i = 0; i < productIds.length; i++) {
+      const code = productIds[i];
+      setSyncAllState((prev) => ({ ...prev, currentIndex: i + 1, currentCode: code }));
+
+      const result = await syncOneProductToCompletion(code, syncAllRegion);
+      if (!result.success) {
+        failed.push({ code, error: result.error || "Unknown error" });
+        setSyncAllState((prev) => ({ ...prev, failedProducts: [...failed] }));
+      }
+    }
+
+    setSyncAllState((prev) => ({ ...prev, status: "completed", currentCode: null, failedProducts: failed }));
+  };
 
   // Persisted state baseline for tracking unsaved modifications
   const [persistedState, setPersistedState] = useState(() => ({
@@ -2188,6 +2388,179 @@ export default function SettingsPage() {
             </button>
           </div>
         </Form>
+      </section>
+
+      {/* ----------------------------------------------------------------- */}
+      {/* SECTION 5: Browser-Driven "Sync All" Card                         */}
+      {/* ----------------------------------------------------------------- */}
+      <section
+        style={{
+          backgroundColor: "#ffffff",
+          border: "1px solid #e1e3e5",
+          borderRadius: "12px",
+          padding: "24px",
+          boxShadow: "0 1px 3px rgba(0,0,0,0.03)",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "flex-start",
+            flexWrap: "wrap",
+            gap: "12px",
+            marginBottom: "16px",
+          }}
+        >
+          <div>
+            <h2
+              style={{
+                margin: "0 0 6px 0",
+                fontSize: "16px",
+                fontWeight: 700,
+                color: "#202223",
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+              }}
+            >
+              <span>🔁</span> Sync All Products Now
+            </h2>
+            <p style={{ margin: 0, fontSize: "13px", color: "#6d7175" }}>
+              Walks the full catalog one product at a time directly from your browser — tries the
+              background queue first, and falls back automatically per-product if it&apos;s unavailable.
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={runSyncAll}
+            disabled={syncAllState.status === "running"}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "6px",
+              padding: "8px 16px",
+              fontSize: "13px",
+              fontWeight: 600,
+              color: syncAllState.status === "running" ? "#6d7175" : "#008060",
+              backgroundColor: syncAllState.status === "running" ? "#f1f2f3" : "#e6f4ea",
+              border: "1px solid #a3d9c9",
+              borderRadius: "8px",
+              cursor: syncAllState.status === "running" ? "not-allowed" : "pointer",
+              transition: "all 0.15s ease",
+            }}
+          >
+            <span>{syncAllState.status === "running" ? "⏳" : "🔁"}</span>
+            {syncAllState.status === "running" ? "Syncing All…" : "Sync All"}
+          </button>
+        </div>
+
+        {syncAllState.status !== "idle" && (
+          <div
+            style={{
+              padding: "14px 16px",
+              backgroundColor: "#f9fafb",
+              borderRadius: "8px",
+              border: "1px solid #e1e3e5",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                fontSize: "12px",
+                color: "#334155",
+                marginBottom: "6px",
+              }}
+            >
+              <span>
+                {syncAllState.status === "running" && syncAllState.currentCode
+                  ? `Syncing Product ${syncAllState.currentIndex} of ${syncAllState.totalProducts}: ${syncAllState.currentCode}`
+                  : syncAllState.status === "completed"
+                  ? `Finished: ${syncAllState.totalProducts - syncAllState.failedProducts.length} of ${
+                      syncAllState.totalProducts
+                    } synced successfully`
+                  : syncAllState.status === "error"
+                  ? "Failed to start Sync All"
+                  : "Preparing…"}
+              </span>
+              {syncAllState.totalProducts > 0 && (
+                <span>
+                  {Math.round((syncAllState.currentIndex / syncAllState.totalProducts) * 100)}%
+                </span>
+              )}
+            </div>
+
+            <div
+              style={{
+                width: "100%",
+                height: "6px",
+                backgroundColor: "#e2e8f0",
+                borderRadius: "3px",
+                overflow: "hidden",
+              }}
+            >
+              <div
+                style={{
+                  height: "100%",
+                  width: `${
+                    syncAllState.totalProducts > 0
+                      ? Math.min(100, Math.round((syncAllState.currentIndex / syncAllState.totalProducts) * 100))
+                      : syncAllState.status === "running"
+                      ? 5
+                      : 0
+                  }%`,
+                  backgroundColor:
+                    syncAllState.status === "completed"
+                      ? syncAllState.failedProducts.length > 0
+                        ? "#f59e0b"
+                        : "#10b981"
+                      : syncAllState.status === "error"
+                      ? "#ef4444"
+                      : "#3b82f6",
+                  borderRadius: "3px",
+                  transition: "width 0.3s ease",
+                }}
+              />
+            </div>
+
+            {syncAllState.failedProducts.length > 0 && (
+              <div style={{ marginTop: "12px" }}>
+                <p style={{ margin: "0 0 6px 0", fontSize: "12px", fontWeight: 700, color: "#b45309" }}>
+                  Failed Products ({syncAllState.failedProducts.length}):
+                </p>
+                <ul style={{ margin: 0, paddingLeft: "18px", fontSize: "12px", color: "#78350f" }}>
+                  {syncAllState.failedProducts.map((f) => (
+                    <li key={f.code}>
+                      <strong>{f.code}</strong>: {f.error}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {syncAllState.status === "completed" && (
+              <div
+                style={{
+                  marginTop: "12px",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  fontSize: "13px",
+                  fontWeight: 600,
+                  color: syncAllState.failedProducts.length > 0 ? "#b45309" : "#047857",
+                }}
+              >
+                <span>{syncAllState.failedProducts.length > 0 ? "⚠️" : "✅"}</span>
+                {syncAllState.failedProducts.length > 0
+                  ? `Sync All completed with ${syncAllState.failedProducts.length} failure(s). See list above.`
+                  : "Sync All completed successfully — every product synced."}
+              </div>
+            )}
+          </div>
+        )}
       </section>
 
       {/* Info Card */}

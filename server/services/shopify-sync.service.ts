@@ -33,6 +33,20 @@ export interface SyncTrendProductOptions {
   targetLocationId?: string | null;
   splitLocationIds?: string[];
   onProgress?: (update: SyncProgressUpdate) => Promise<void> | void;
+  /**
+   * When both are set, only this slice of the product's (canonicalized) variant
+   * list is created/updated/media-linked/inventory-distributed by this call —
+   * product-level fields (title, description, tags, channel publication) are
+   * still synced in full on every call, since those aren't per-variant.
+   *
+   * Used by the client-chunk fallback sync path (app/routes/api.proxy.$.ts,
+   * endpoint "sync-chunk") so a product with many variants can be synced across
+   * several short-lived serverless invocations instead of one that risks running
+   * past Vercel's execution ceiling. Each call is still a full, idempotent
+   * product-level sync — only the variant matrix is bounded.
+   */
+  variantOffset?: number;
+  variantLimit?: number;
 }
 
 export interface SyncTrendProductResult {
@@ -43,6 +57,8 @@ export interface SyncTrendProductResult {
   skuList: string[];
   message: string;
   isMock?: boolean;
+  /** Total canonicalized variant count for the product, independent of variantOffset/variantLimit slicing. */
+  totalVariantCount: number;
 }
 
 export interface DeleteTrendProductOptions {
@@ -1660,6 +1676,25 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
     });
   }
 
+  // Record the full canonicalized count before any chunk slicing below, so callers
+  // (the sync-chunk fallback endpoint) can tell how many variants remain overall.
+  const totalVariantCount = normalizedSpecs.length;
+
+  // Bound this call to a slice of the variant matrix when chunking (see
+  // SyncTrendProductOptions.variantOffset/variantLimit doc comment). Mutate in
+  // place so every downstream use of `normalizedSpecs` — variant create/update,
+  // media linking, inventory distribution, skuList — only sees this chunk's slice.
+  if (
+    typeof options.variantOffset === "number" &&
+    typeof options.variantLimit === "number" &&
+    options.variantLimit > 0
+  ) {
+    const sliceStart = Math.max(0, options.variantOffset);
+    const sliced = normalizedSpecs.slice(sliceStart, sliceStart + options.variantLimit);
+    normalizedSpecs.length = 0;
+    normalizedSpecs.push(...sliced);
+  }
+
   const skuList: string[] = normalizedSpecs.map((s) => s.canonicalSku);
   const variantLedgerEntries: {
     shopifyVariantId: string;
@@ -2436,6 +2471,7 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
     skuList,
     message: `Product ${trendsCode} successfully ${action} in Shopify (${skuList.length} variants synced).`,
     isMock: isMockProduct,
+    totalVariantCount,
   };
 }
 

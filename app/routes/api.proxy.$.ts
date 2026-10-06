@@ -1,5 +1,5 @@
 import type { LoaderFunctionArgs, ActionFunctionArgs } from "react-router";
-import type { Region, ApiProxyResponse, ProductData } from "../../shared/types/trends.types";
+import type { Region, ApiProxyResponse, ProductData, ProductListData, ProductShowData } from "../../shared/types/trends.types";
 import { normalizePricing } from "../../shared/types/trends.types";
 import { cacheAdapter, CacheKeyBuilder, DEFAULT_CACHE_CONFIG } from "../../server/cache";
 import { TrendsApiClient } from "../../server/api-client/trends-client";
@@ -7,6 +7,7 @@ import {
   syncTrendProductToShopify,
   deleteTrendProductFromShopify,
   getTrendProductSyncStatuses,
+  buildVariantSpecs,
 } from "../../server/services/shopify-sync.service";
 import {
   createSyncJob,
@@ -153,6 +154,60 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       region,
       shop,
       data: syncMap,
+    });
+  }
+
+  // Initialization step for the Settings page "Sync All" flow: paginates the
+  // Trends catalog to build the full list of product codes, WITHOUT syncing any
+  // of them — actual syncing happens one product at a time, driven by the browser,
+  // via repeated POSTs to "sync-product" (itself falling back to "sync-chunk" per
+  // product if QStash is unavailable). This keeps a single request fast (read-only
+  // catalog paging) while never attempting the full bulk sync in one invocation.
+  if (endpoint === "sync-all-init") {
+    const PAGE_SIZE = 100;
+    const MAX_PAGES = 50; // safety cap: up to 5,000 products per Sync All click
+    const productIds: string[] = [];
+    const products: Array<{ code: string; name: string }> = [];
+
+    let page = 1;
+    let totalPages = 1;
+    try {
+      do {
+        const listRes = await TrendsApiClient.request<ProductListData>(
+          region,
+          `products?page_no=${page}&page=${page}&page_size=${PAGE_SIZE}&inc_discontinued=false`,
+          { settings: appSettings }
+        );
+        const pageProducts = Array.isArray(listRes.data?.data) ? listRes.data.data : [];
+        for (const p of pageProducts) {
+          if (!p?.code) continue;
+          productIds.push(String(p.code));
+          products.push({ code: String(p.code), name: p.name || String(p.code) });
+        }
+
+        const responseTotalItems = listRes.data?.total_items;
+        totalPages = Math.max(
+          1,
+          listRes.data?.page_count || (responseTotalItems ? Math.ceil(responseTotalItems / PAGE_SIZE) : 1)
+        );
+        page += 1;
+      } while (page <= totalPages && page <= MAX_PAGES);
+    } catch (catalogErr) {
+      console.error("[ProxyAction] sync-all-init: failed to page Trends catalog:", catalogErr);
+      return Response.json(
+        { success: false, error: "Failed to load product catalog for Sync All" },
+        { status: 500 }
+      );
+    }
+
+    return Response.json({
+      success: true,
+      region,
+      totalProducts: productIds.length,
+      productIds,
+      products,
+      batchSize: 1,
+      truncated: totalPages > MAX_PAGES,
     });
   }
 
@@ -386,6 +441,34 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         );
       }
 
+      // Resolve the full product payload up front (not deferred to the worker) —
+      // we need it either way: to hand to QStash, and to compute the variant
+      // chunk plan if QStash dispatch fails and we fall back to client-driven sync.
+      if (!productToSync) {
+        try {
+          const showRes = await TrendsApiClient.request<ProductShowData>(
+            region,
+            `products/${trendsCode}`,
+            { settings: appSettings }
+          );
+          const rawShow = showRes.data?.data;
+          productToSync = Array.isArray(rawShow) ? rawShow[0] : rawShow;
+        } catch (fetchErr) {
+          console.warn(`[ProxyAction] Could not pre-fetch product ${trendsCode}:`, fetchErr);
+        }
+      }
+      if (!productToSync) {
+        productToSync = {
+          code: trendsCode,
+          name: `Product ${trendsCode}`,
+          description: "",
+          categories: [],
+          images: [],
+          stock: [],
+          pricing: [],
+        } as ProductData;
+      }
+
       // 1. Initialize background sync job in PostgreSQL immediately
       const job = await createSyncJob(shop, trendsCode, region);
 
@@ -400,9 +483,12 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       // Retries are capped conservatively (2) for the same reason: transient
       // failures still get one automatic retry, but we don't burn quota chasing
       // deterministic failures.
+      const syncWorkerUrl = resolveSyncWorkerUrl();
+      console.info(`[ProxyAction] Job ${job.id}: publishing to QStash worker URL: ${syncWorkerUrl}`);
+
       try {
-        await getQStashClient().publishJSON({
-          url: resolveSyncWorkerUrl(),
+        const publishRes = await getQStashClient().publishJSON({
+          url: syncWorkerUrl,
           retries: 2,
           body: {
             jobId: job.id,
@@ -417,24 +503,63 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
             splitLocationIds: body.splitLocationIds,
           },
         });
+
+        // publishJSON resolving does NOT mean the worker ran (or even that the URL
+        // is reachable) — it only means QStash accepted the message for delivery.
+        // Log the messageId so it can be cross-referenced against delivery/retry
+        // status in the Upstash QStash console if the worker never appears to fire.
+        console.info(
+          `[ProxyAction] Job ${job.id}: QStash accepted message ${publishRes.messageId} ` +
+            `(url: ${publishRes.url}, deduplicated: ${Boolean(publishRes.deduplicated)})`
+        );
       } catch (publishErr) {
+        // QStash dispatch failed (quota exhausted, auth/signing misconfiguration,
+        // network/service outage, etc). Don't fail the request — fall back to a
+        // client-orchestrated chunked sync so the user's click still makes progress.
         const publishMessage =
           publishErr instanceof Error ? publishErr.message : "Failed to queue sync job with QStash";
-        console.error(`[ProxyAction] QStash publish failed for job ${job.id}:`, publishErr);
+        console.warn(
+          `[ProxyAction] Job ${job.id}: QStash dispatch failed, falling back to client-driven chunk sync:`,
+          publishMessage
+        );
+
+        const CHUNK_SIZE = 10;
+        const { specs } = buildVariantSpecs(productToSync, region, trendsCode);
+        const totalVariants = Math.max(1, specs.length);
 
         await prisma.trendSyncJob.update({
           where: { id: job.id },
           data: {
-            status: "FAILED",
-            stage: "FAILED",
-            errorMessage: publishMessage,
-            message: `Failed to queue sync job: ${publishMessage}`,
+            status: "IN_PROGRESS",
+            stage: "STAGE_1_PRODUCT_VARIANTS",
+            progress: 5,
+            message: `Background queue unavailable (${publishMessage}) — syncing via browser-driven chunks instead.`,
           },
         });
 
         return Response.json(
-          { success: false, jobId: job.id, error: publishMessage },
-          { status: 502 }
+          {
+            success: true,
+            mode: "client_chunk",
+            jobId: job.id,
+            productId: trendsCode,
+            trendsCode,
+            region,
+            totalVariants,
+            chunkSize: CHUNK_SIZE,
+            productToSync,
+            syncLocks: body.syncLocks,
+            isMock: body.isMock,
+            inventorySyncMode: body.inventorySyncMode,
+            targetLocationId: body.targetLocationId,
+            splitLocationIds: body.splitLocationIds,
+            status: "IN_PROGRESS",
+            stage: "STAGE_1_PRODUCT_VARIANTS",
+            progress: 5,
+            message: "QStash unavailable — syncing this product in chunks from your browser.",
+            timestamp: new Date().toISOString(),
+          },
+          { status: 200 }
         );
       }
 
@@ -442,6 +567,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       return Response.json(
         {
           success: true,
+          mode: "background",
           jobId: job.id,
           productId: trendsCode,
           trendsCode,
@@ -469,6 +595,107 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         },
         { status: 500 }
       );
+    }
+  }
+
+  // Processes one bounded slice of a product's variant matrix. Used exclusively by
+  // the client-driven chunk fallback (see "sync-product" above): the browser calls
+  // this repeatedly with increasing `offset` until `hasMore` is false, so a product
+  // with many variants completes across several short requests instead of one that
+  // risks running past Vercel's execution ceiling. Each call still fully syncs
+  // product-level fields (title, description, channel publication) — only the
+  // variant matrix itself is bounded to [offset, offset + limit).
+  if (endpoint === "sync-chunk") {
+    try {
+      const body = (await request.json().catch(() => ({}))) as {
+        jobId?: string;
+        productId?: string;
+        trendsCode?: string;
+        product?: ProductData;
+        productToSync?: ProductData;
+        offset?: number;
+        limit?: number;
+        syncLocks?: string[];
+        isMock?: boolean;
+        inventorySyncMode?: "single" | "split_equal";
+        targetLocationId?: string | null;
+        splitLocationIds?: string[];
+      };
+
+      const trendsCode = String(body.trendsCode || body.productId || "").trim();
+      const productToSync = body.productToSync || body.product;
+      const jobId = body.jobId;
+      const offset = Math.max(0, Number(body.offset) || 0);
+      const limit = Math.max(1, Number(body.limit) || 10);
+
+      if (!trendsCode || !productToSync || !jobId) {
+        return Response.json(
+          { success: false, error: "Missing jobId, trendsCode, or productToSync for chunk sync" },
+          { status: 400 }
+        );
+      }
+
+      const chunkResult = await syncTrendProductToShopify({
+        admin: adminClient,
+        shop,
+        trendsProduct: productToSync,
+        region,
+        syncLocks: body.syncLocks,
+        isMock: body.isMock,
+        inventorySyncMode: body.inventorySyncMode,
+        targetLocationId: body.targetLocationId,
+        splitLocationIds: body.splitLocationIds,
+        variantOffset: offset,
+        variantLimit: limit,
+      });
+
+      const processedCount = chunkResult.skuList.length;
+      const totalVariants = Math.max(1, chunkResult.totalVariantCount);
+      const nextOffset = offset + limit;
+      const hasMore = nextOffset < totalVariants;
+      const progress = Math.min(99, Math.round((Math.min(nextOffset, totalVariants) / totalVariants) * 90) + 5);
+
+      await prisma.trendSyncJob.update({
+        where: { id: jobId },
+        data: hasMore
+          ? {
+              status: "IN_PROGRESS",
+              stage: "STAGE_1_PRODUCT_VARIANTS",
+              progress,
+              message: `Synced variants ${offset + 1}-${Math.min(nextOffset, totalVariants)} of ${totalVariants}...`,
+            }
+          : {
+              status: "COMPLETED",
+              stage: "COMPLETED",
+              progress: 100,
+              message: chunkResult.message,
+              result: chunkResult as any,
+            },
+      });
+
+      return Response.json({
+        success: true,
+        jobId,
+        trendsCode,
+        region,
+        shopifyProductId: chunkResult.shopifyProductId,
+        shopifyHandle: chunkResult.shopifyHandle,
+        processedCount,
+        offset,
+        limit,
+        nextOffset: hasMore ? nextOffset : null,
+        totalVariants,
+        hasMore,
+        progress: hasMore ? progress : 100,
+        status: hasMore ? "IN_PROGRESS" : "COMPLETED",
+        message: hasMore
+          ? `Synced variants ${offset + 1}-${Math.min(nextOffset, totalVariants)} of ${totalVariants}`
+          : chunkResult.message,
+      });
+    } catch (chunkErr: unknown) {
+      const message = chunkErr instanceof Error ? chunkErr.message : "Chunk sync failed";
+      console.error(`[ProxyAction] sync-chunk failed:`, chunkErr);
+      return Response.json({ success: false, error: message }, { status: 500 });
     }
   }
 

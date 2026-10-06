@@ -31,6 +31,16 @@ interface SyncWorkerPayload {
  * once the full sync has actually finished.
  */
 export const action = async ({ request }: ActionFunctionArgs) => {
+  // Entry log BEFORE anything else (body read, signature check) so Vercel's runtime
+  // logs can confirm whether QStash's HTTP call is reaching this function at all. If
+  // this line never appears for a published message, the request isn't arriving here
+  // — look at the resolved worker URL logged in api.proxy.$.ts and whether it's
+  // actually a publicly reachable Vercel domain (not a local/dev tunnel).
+  console.info(
+    `[SyncWorker] Incoming ${request.method} request from ${request.headers.get("user-agent") || "unknown"} ` +
+      `(has upstash-signature: ${request.headers.has("upstash-signature")})`
+  );
+
   const rawBody = await request.text();
 
   // 1. Verify the request genuinely came from QStash before trusting the payload.

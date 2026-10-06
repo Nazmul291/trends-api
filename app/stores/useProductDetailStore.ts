@@ -158,6 +158,155 @@ export function startSyncPolling(jobId: string, productId: string | number, regi
   syncPollInterval = setInterval(poll, 2000);
 }
 
+interface ClientChunkPlan {
+  totalVariants: number;
+  chunkSize: number;
+  productToSync: ProductData;
+  syncLocks?: string[];
+  isMock?: boolean;
+  inventorySyncMode?: "single" | "split_equal";
+  targetLocationId?: string | null;
+  splitLocationIds?: string[];
+}
+
+interface SyncChunkResponse {
+  success: boolean;
+  error?: string;
+  status?: string;
+  message?: string;
+  progress?: number;
+  totalVariants?: number;
+  hasMore?: boolean;
+  nextOffset?: number | null;
+  shopifyProductId?: string;
+}
+
+/**
+ * Browser-driven fallback for when QStash dispatch failed (see api.proxy.$.ts
+ * "sync-product": mode === "client_chunk"). Sequentially calls the "sync-chunk"
+ * endpoint with an advancing offset until the whole variant matrix is synced,
+ * updating the same store fields `startSyncPolling` does so the rest of the UI
+ * doesn't need to know which path produced the final COMPLETED/FAILED state.
+ */
+export async function startClientChunkSync(
+  jobId: string,
+  trendsCode: string | number,
+  region: string,
+  plan: ClientChunkPlan
+) {
+  stopSyncPolling();
+
+  const { totalVariants, chunkSize, productToSync } = plan;
+  const MAX_RETRIES_PER_CHUNK = 2;
+  // `totalVariants` here is only this page's *initial estimate* (built from
+  // whatever stock data the trigger request happened to have on hand). The sync
+  // pipeline re-fetches live stock on every call and may see a different count —
+  // so loop continuation below is driven entirely by each chunk response's own
+  // `hasMore`/`totalVariants`, never by this stale outer bound. The iteration cap
+  // is just a safety net against an unexpected server-side loop, not the real
+  // termination condition.
+  let offset = 0;
+  const MAX_CHUNK_ITERATIONS = 500;
+
+  useProductDetailStore.setState({
+    syncStatus: "loading",
+    syncStage: "STAGE_1_PRODUCT_VARIANTS",
+    syncProgress: 5,
+    syncError: null,
+    syncMessage: `Syncing variants 1-${Math.min(chunkSize, totalVariants)} of ${totalVariants}...`,
+  });
+
+  for (let iteration = 0; iteration < MAX_CHUNK_ITERATIONS; iteration++) {
+    let attempt = 0;
+    let lastErr: Error | null = null;
+    let chunkData: SyncChunkResponse | null = null;
+
+    while (attempt <= MAX_RETRIES_PER_CHUNK && !chunkData) {
+      try {
+        const res = await fetch(`/api/proxy/${region}/sync-chunk`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            jobId,
+            trendsCode,
+            productToSync,
+            offset,
+            limit: chunkSize,
+            syncLocks: plan.syncLocks,
+            isMock: plan.isMock,
+            inventorySyncMode: plan.inventorySyncMode,
+            targetLocationId: plan.targetLocationId,
+            splitLocationIds: plan.splitLocationIds,
+          }),
+        });
+
+        const data = await res.json();
+        if (!res.ok || !data.success) {
+          throw new Error(data.error || `Chunk sync failed with HTTP ${res.status}`);
+        }
+        chunkData = data;
+      } catch (err) {
+        lastErr = err instanceof Error ? err : new Error("Chunk sync request failed");
+        attempt += 1;
+        if (attempt <= MAX_RETRIES_PER_CHUNK) {
+          console.warn(
+            `[useProductDetailStore] Chunk at offset ${offset} failed (attempt ${attempt}/${MAX_RETRIES_PER_CHUNK}), retrying:`,
+            lastErr.message
+          );
+          await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+        }
+      }
+    }
+
+    if (!chunkData) {
+      useProductDetailStore.setState({
+        syncStatus: "error",
+        syncStage: "FAILED",
+        syncProgress: 0,
+        syncError: lastErr?.message || "Chunk sync failed after retries",
+        syncMessage: null,
+      });
+      return;
+    }
+
+    const effectiveTotal = chunkData.totalVariants || totalVariants;
+    const rangeEnd = Math.min(offset + chunkSize, effectiveTotal);
+
+    if (chunkData.status === "COMPLETED" || !chunkData.hasMore) {
+      const shopifyProductId = chunkData.shopifyProductId || null;
+      const shopifyNumericId = shopifyProductId ? String(shopifyProductId).split("/").pop() : null;
+
+      useProductDetailStore.setState({
+        syncStatus: "success",
+        syncStage: "COMPLETED",
+        syncProgress: 100,
+        syncMessage: chunkData.message || "Product sync completed successfully.",
+        syncError: null,
+        isSynced: true,
+        shopifyProductId,
+        shopifyNumericId,
+      });
+      return;
+    }
+
+    useProductDetailStore.setState({
+      syncStage: "STAGE_1_PRODUCT_VARIANTS",
+      syncProgress: chunkData.progress ?? Math.round((rangeEnd / effectiveTotal) * 90) + 5,
+      syncMessage: `Syncing variants ${offset + 1}-${rangeEnd} of ${effectiveTotal}...`,
+    });
+
+    offset = chunkData.nextOffset ?? offset + chunkSize;
+  }
+
+  useProductDetailStore.setState({
+    syncStatus: "error",
+    syncStage: "FAILED",
+    syncProgress: 0,
+    syncError: "Chunk sync did not complete after an unexpectedly large number of chunks.",
+    syncMessage: null,
+  });
+}
+
 export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
   product: null,
   productStatus: "idle",
@@ -411,6 +560,33 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
       }
 
       const jobId = data.jobId;
+
+      if (data.mode === "client_chunk") {
+        // QStash dispatch failed server-side; the backend already handed us
+        // everything needed to drive the rest of the sync from here.
+        set({
+          syncJobId: jobId,
+          syncStage: data.stage || "STAGE_1_PRODUCT_VARIANTS",
+          syncProgress: data.progress || 5,
+          syncMessage: data.message || "Syncing in chunks from your browser...",
+        });
+
+        if (jobId) {
+          void startClientChunkSync(jobId, targetProduct.code, region, {
+            totalVariants: data.totalVariants || 1,
+            chunkSize: data.chunkSize || 10,
+            productToSync: data.productToSync || targetProduct,
+            syncLocks: data.syncLocks,
+            isMock: data.isMock,
+            inventorySyncMode: data.inventorySyncMode,
+            targetLocationId: data.targetLocationId,
+            splitLocationIds: data.splitLocationIds,
+          });
+        }
+
+        return true;
+      }
+
       set({
         syncJobId: jobId,
         syncStage: data.stage || "QUEUED",

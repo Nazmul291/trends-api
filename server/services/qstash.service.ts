@@ -53,16 +53,36 @@ export function getQStashReceiver(): Receiver | null {
 }
 
 /**
+ * Strips trailing slashes and guarantees an `https://` (or existing `http://`)
+ * scheme. `SHOPIFY_APP_URL` is normally a full URL, but if it's ever set to a bare
+ * host (or has stray whitespace/trailing slashes from a copy-paste), QStash's
+ * `publishJSON` will either throw on an invalid URL or — worse — silently accept a
+ * malformed one that never reaches us, with no error surfacing on our side at all.
+ */
+function normalizeBaseUrl(raw: string): string {
+  const trimmed = raw.trim().replace(/\/+$/, "");
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+}
+
+/**
  * Resolves the publicly reachable base URL for this deployment so QStash can call
  * back into our own worker route. Prefers the explicitly configured app URL (stable
  * custom domain), falling back to Vercel's auto-generated deployment URL.
  */
 export function resolveAppBaseUrl(): string {
   const configured = process.env.SHOPIFY_APP_URL || process.env.HOST;
-  if (configured) return configured.replace(/\/+$/, "");
+  if (configured) {
+    const normalized = normalizeBaseUrl(configured);
+    console.info(`[QStash] Resolved app base URL from SHOPIFY_APP_URL/HOST: ${normalized}`);
+    return normalized;
+  }
 
   const vercelUrl = process.env.VERCEL_URL;
-  if (vercelUrl) return `https://${vercelUrl.replace(/^https?:\/\//, "").replace(/\/+$/, "")}`;
+  if (vercelUrl) {
+    const normalized = normalizeBaseUrl(vercelUrl);
+    console.info(`[QStash] Resolved app base URL from VERCEL_URL: ${normalized}`);
+    return normalized;
+  }
 
   throw new Error(
     "Unable to resolve app base URL for QStash callback: set SHOPIFY_APP_URL (or rely on Vercel's VERCEL_URL)"
