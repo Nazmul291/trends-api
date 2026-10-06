@@ -655,9 +655,35 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       const hasMore = nextOffset < totalVariants;
       const progress = Math.min(99, Math.round((Math.min(nextOffset, totalVariants) / totalVariants) * 90) + 5);
 
+      // chunkResult.success only means the pipeline didn't throw — Shopify's bulk
+      // variant mutations return partial success with userErrors instead of
+      // throwing, so verify this slice's variants actually landed in Shopify
+      // before reporting progress/completion. A shortfall here stops the loop
+      // (further chunks of the same broken option/SKU won't help) and fails the
+      // job instead of silently under-reporting.
+      const expectedThisChunk = Math.min(limit, Math.max(0, totalVariants - offset));
+      // Only meaningful when we actually attempted real Shopify calls — skip for
+      // the offline/mock path (no admin client), which never has real GIDs.
+      const shortfall = adminClient ? expectedThisChunk - chunkResult.actualVariantCount : 0;
+      const isFailure = shortfall > 0;
+
+      const failureMsg = isFailure
+        ? `Only ${chunkResult.actualVariantCount} of ${expectedThisChunk} variants in this chunk ` +
+          `(offset ${offset}) were actually created in Shopify. ${chunkResult.message}`
+        : null;
+
       await prisma.trendSyncJob.update({
         where: { id: jobId },
-        data: hasMore
+        data: isFailure
+          ? {
+              status: "FAILED",
+              stage: "FAILED",
+              progress: 0,
+              errorMessage: failureMsg,
+              message: failureMsg,
+              result: chunkResult as any,
+            }
+          : hasMore
           ? {
               status: "IN_PROGRESS",
               stage: "STAGE_1_PRODUCT_VARIANTS",
@@ -683,12 +709,15 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         processedCount,
         offset,
         limit,
-        nextOffset: hasMore ? nextOffset : null,
+        nextOffset: isFailure || !hasMore ? null : nextOffset,
         totalVariants,
-        hasMore,
-        progress: hasMore ? progress : 100,
-        status: hasMore ? "IN_PROGRESS" : "COMPLETED",
-        message: hasMore
+        hasMore: isFailure ? false : hasMore,
+        progress: isFailure ? 0 : hasMore ? progress : 100,
+        status: isFailure ? "FAILED" : hasMore ? "IN_PROGRESS" : "COMPLETED",
+        error: failureMsg || undefined,
+        message: isFailure
+          ? failureMsg
+          : hasMore
           ? `Synced variants ${offset + 1}-${Math.min(nextOffset, totalVariants)} of ${totalVariants}`
           : chunkResult.message,
       });

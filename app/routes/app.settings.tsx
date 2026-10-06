@@ -53,6 +53,7 @@ interface SyncChunkResponse {
   success: boolean;
   error?: string;
   status?: string;
+  message?: string;
   hasMore?: boolean;
   nextOffset?: number | null;
 }
@@ -134,6 +135,11 @@ async function syncOneProductToCompletion(
 
       if (!chunkData) {
         return { success: false, error: lastErr || "Chunk sync failed after retries" };
+      }
+      // Check FAILED explicitly before `!hasMore` — a chunk can set hasMore:
+      // false specifically because it failed (e.g. a variant count shortfall).
+      if (chunkData.status === "FAILED") {
+        return { success: false, error: chunkData.error || chunkData.message || "Chunk sync failed" };
       }
       if (chunkData.status === "COMPLETED" || !chunkData.hasMore) {
         return { success: true };

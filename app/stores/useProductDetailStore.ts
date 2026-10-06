@@ -272,6 +272,20 @@ export async function startClientChunkSync(
     const effectiveTotal = chunkData.totalVariants || totalVariants;
     const rangeEnd = Math.min(offset + chunkSize, effectiveTotal);
 
+    // Check FAILED explicitly, before falling through to `!hasMore` — a chunk
+    // response can set hasMore: false specifically because it failed (e.g. a
+    // variant count shortfall), which must not be read as "done, successfully."
+    if (chunkData.status === "FAILED") {
+      useProductDetailStore.setState({
+        syncStatus: "error",
+        syncStage: "FAILED",
+        syncProgress: 0,
+        syncError: chunkData.error || chunkData.message || "Chunk sync failed",
+        syncMessage: null,
+      });
+      return;
+    }
+
     if (chunkData.status === "COMPLETED" || !chunkData.hasMore) {
       const shopifyProductId = chunkData.shopifyProductId || null;
       const shopifyNumericId = shopifyProductId ? String(shopifyProductId).split("/").pop() : null;

@@ -59,6 +59,17 @@ export interface SyncTrendProductResult {
   isMock?: boolean;
   /** Total canonicalized variant count for the product, independent of variantOffset/variantLimit slicing. */
   totalVariantCount: number;
+  /**
+   * How many of this call's variants actually got a real Shopify ProductVariant
+   * GID (as opposed to falling back to a local placeholder id after Shopify
+   * rejected/failed to create them — e.g. a SKU collision or option-value
+   * error). `success: true` alone does NOT mean every variant made it into
+   * Shopify: bulk variant mutations return partial success with userErrors
+   * instead of throwing, so callers that need "fully synced" must compare this
+   * against the variant count they requested (totalVariantCount, or the slice
+   * size for a chunked call) rather than trusting `success`/`message` alone.
+   */
+  actualVariantCount: number;
 }
 
 export interface DeleteTrendProductOptions {
@@ -2564,11 +2575,36 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
     `;
   }
 
+  // `success: true` up to this point only means the pipeline ran without
+  // throwing — productVariantsBulkCreate/Update return partial success with
+  // userErrors instead of throwing, so a Shopify-side rejection (SKU collision,
+  // invalid option value, etc.) for some variants would otherwise go unnoticed
+  // and get reported as a full success. Count how many ledger entries actually
+  // got a real Shopify variant GID (vs. the local fallback id used when a match
+  // couldn't be found) and surface any shortfall in the message. Not applicable
+  // to the offline/mock path (no `admin`), which never had real GIDs to begin with.
+  const actualVariantCount = variantLedgerEntries.filter((v) =>
+    v.shopifyVariantId.startsWith("gid://shopify/ProductVariant/")
+  ).length;
+  const requestedThisCall = normalizedSpecs.length;
+  const shortfall = admin ? requestedThisCall - actualVariantCount : 0;
+
+  const completionMessage =
+    shortfall > 0
+      ? `Product ${trendsCode} ${action} in Shopify, but only ${actualVariantCount} of ${requestedThisCall} ` +
+        `variant(s) in this call were actually created/matched in Shopify — ${shortfall} failed ` +
+        `(see [Shopify Sync Diagnostic] logs for the userErrors Shopify returned).`
+      : `Product ${trendsCode} successfully ${action} in Shopify (${skuList.length} variants synced).`;
+
+  if (shortfall > 0) {
+    console.warn(`[Shopify Sync] ${completionMessage}`);
+  }
+
   if (options.onProgress) {
     await options.onProgress({
       stage: "COMPLETED",
       progress: 100,
-      message: `Product ${trendsCode} successfully ${action} in Shopify (${skuList.length} variants synced).`,
+      message: completionMessage,
     });
   }
 
@@ -2578,9 +2614,10 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
     shopifyProductId: resolvedShopifyProductId,
     shopifyHandle: resolvedShopifyHandle,
     skuList,
-    message: `Product ${trendsCode} successfully ${action} in Shopify (${skuList.length} variants synced).`,
+    message: completionMessage,
     isMock: isMockProduct,
     totalVariantCount,
+    actualVariantCount,
   };
 }
 

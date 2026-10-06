@@ -232,7 +232,38 @@ export async function executeSyncJobAsync(
       },
     });
 
-    // 4. Mark COMPLETED
+    // 4. Mark COMPLETED — but only if Shopify actually created every variant.
+    // syncTrendProductToShopify can return success: true after a PARTIAL
+    // variant create/update (Shopify's bulk mutations return userErrors
+    // instead of throwing), so blindly trusting `success` here would report a
+    // job as fully synced when, say, only 3 of 29 variants actually made it
+    // into Shopify. Compare actualVariantCount against totalVariantCount
+    // (this worker always runs the full, unchunked sync) and fail loudly
+    // instead of silently under-reporting.
+    const isFullySynced = syncResult.actualVariantCount >= syncResult.totalVariantCount;
+
+    if (!isFullySynced) {
+      const shortfallMsg =
+        `Only ${syncResult.actualVariantCount} of ${syncResult.totalVariantCount} variants were actually ` +
+        `created in Shopify for product ${options.trendsCode}. Shopify rejected the rest (see ` +
+        `[Shopify Sync Diagnostic] logs for the exact userErrors). ${syncResult.message}`;
+
+      await prisma.trendSyncJob.update({
+        where: { id: jobId },
+        data: {
+          status: "FAILED",
+          stage: "FAILED",
+          progress: 0,
+          errorMessage: shortfallMsg,
+          message: shortfallMsg,
+          result: syncResult as any,
+        },
+      });
+
+      console.error(`[SyncJobService] Job ${jobId} for product ${options.trendsCode}: ${shortfallMsg}`);
+      return;
+    }
+
     await prisma.trendSyncJob.update({
       where: { id: jobId },
       data: {
