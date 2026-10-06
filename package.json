@@ -2,7 +2,7 @@
   "name": "trends-api",
   "private": true,
   "scripts": {
-    "build": "prisma generate && prisma migrate deploy && react-router build",
+    "build": "prisma generate && react-router build",
     "dev": "vite dev",
     "config:link": "shopify app config link",
     "generate": "shopify app generate",
