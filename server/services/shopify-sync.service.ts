@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { Prisma } from "@prisma/client";
 import type { ProductData, Region, StockListData } from "../../shared/types/trends.types";
 import { normalizePricing } from "../../shared/types/trends.types";
 import { TrendsApiClient } from "../api-client/trends-client";
@@ -2388,27 +2389,35 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
     },
   });
 
-  // Track all variants in Prisma
-  for (const vEntry of variantLedgerEntries) {
-    await prisma.trendVariantSync.upsert({
-      where: {
-        shopifyVariantId: vEntry.shopifyVariantId,
-      },
-      create: {
-        productSyncId: savedSync.id,
-        shopifyVariantId: vEntry.shopifyVariantId,
-        inventoryItemId: vEntry.inventoryItemId || null,
-        stockCode: vEntry.stockCode,
-        region: normalizedRegion,
-        lastStockQty: vEntry.quantity,
-      },
-      update: {
-        ...(vEntry.inventoryItemId ? { inventoryItemId: vEntry.inventoryItemId } : {}),
-        stockCode: vEntry.stockCode,
-        region: normalizedRegion,
-        lastStockQty: vEntry.quantity,
-      },
-    });
+  // Track all variants in Prisma.
+  // Bulk upsert in a single round trip instead of N sequential awaits: on a
+  // product with many variants, awaiting one upsert at a time added enough
+  // cumulative DB latency to risk running past the serverless duration ceiling
+  // (each round trip pays full network + statement overhead on its own).
+  if (variantLedgerEntries.length > 0) {
+    // Guard against ON CONFLICT targeting the same row twice within one statement
+    // (Postgres rejects that) by keeping only the last entry per variant, matching
+    // the "last write wins" behavior the previous sequential loop had.
+    const dedupedEntries = Array.from(
+      new Map(variantLedgerEntries.map((vEntry) => [vEntry.shopifyVariantId, vEntry])).values()
+    );
+
+    const rows = dedupedEntries.map(
+      (vEntry) =>
+        Prisma.sql`(${randomUUID()}, ${savedSync.id}, ${vEntry.shopifyVariantId}, ${vEntry.inventoryItemId || null}, ${vEntry.stockCode}, ${normalizedRegion}, ${vEntry.quantity}, NOW())`
+    );
+
+    await prisma.$executeRaw`
+      INSERT INTO "TrendVariantSync"
+        ("id", "productSyncId", "shopifyVariantId", "inventoryItemId", "stockCode", "region", "lastStockQty", "updatedAt")
+      VALUES ${Prisma.join(rows)}
+      ON CONFLICT ("shopifyVariantId") DO UPDATE SET
+        "inventoryItemId" = COALESCE(EXCLUDED."inventoryItemId", "TrendVariantSync"."inventoryItemId"),
+        "stockCode" = EXCLUDED."stockCode",
+        "region" = EXCLUDED."region",
+        "lastStockQty" = EXCLUDED."lastStockQty",
+        "updatedAt" = NOW()
+    `;
   }
 
   if (options.onProgress) {

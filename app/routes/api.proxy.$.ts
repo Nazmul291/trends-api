@@ -1,5 +1,5 @@
 import type { LoaderFunctionArgs, ActionFunctionArgs } from "react-router";
-import type { Region, ApiProxyResponse, ProductData, ProductShowData } from "../../shared/types/trends.types";
+import type { Region, ApiProxyResponse, ProductData } from "../../shared/types/trends.types";
 import { normalizePricing } from "../../shared/types/trends.types";
 import { cacheAdapter, CacheKeyBuilder, DEFAULT_CACHE_CONFIG } from "../../server/cache";
 import { TrendsApiClient } from "../../server/api-client/trends-client";
@@ -11,8 +11,8 @@ import {
 import {
   createSyncJob,
   getSyncJobStatus,
-  executeSyncJobAsync,
 } from "../../server/services/sync-job.service";
+import { getQStashClient, resolveSyncWorkerUrl } from "../../server/services/qstash.service";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getAppSettings } from "../../server/settings/app-settings.service";
@@ -281,7 +281,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   }
 };
 
-export const action = async ({ request, params, context }: ActionFunctionArgs) => {
+export const action = async ({ request, params }: ActionFunctionArgs) => {
   let adminClient: any = undefined;
   let shop = "demo.myshopify.com";
 
@@ -389,59 +389,53 @@ export const action = async ({ request, params, context }: ActionFunctionArgs) =
       // 1. Initialize background sync job in PostgreSQL immediately
       const job = await createSyncJob(shop, trendsCode, region);
 
-      // 2. Launch background execution without blocking the HTTP response
-      const workerPromise = (async () => {
-        try {
-          let fullProduct = productToSync;
-          if (!fullProduct) {
-            try {
-              const showRes = await TrendsApiClient.request<ProductShowData>(
-                region,
-                `products/${trendsCode}`,
-                { settings: appSettings }
-              );
-              const rawShow = showRes.data?.data;
-              fullProduct = Array.isArray(rawShow) ? rawShow[0] : rawShow;
-            } catch (fetchErr) {
-              console.warn(
-                `[ProxyAction] Could not pre-fetch product ${trendsCode} in background:`,
-                fetchErr
-              );
-            }
-          }
-
-          if (!fullProduct) {
-            fullProduct = {
-              code: trendsCode,
-              name: `Product ${trendsCode}`,
-              description: "",
-              categories: [],
-              images: [],
-              stock: [],
-              pricing: [],
-            } as ProductData;
-          }
-
-          await executeSyncJobAsync(job.id, {
+      // 2. Dispatch the job to QStash as a single durable HTTP message targeting our
+      // dedicated worker route. QStash (not this request's lifetime) owns retries
+      // and delivery guarantees, so the sync survives this function's container
+      // freezing right after the response below is sent.
+      //
+      // Exactly ONE message per product sync — all of that product's variants ride
+      // along inside `productToSync`/the worker's own re-fetch, never one message
+      // per variant — to stay well under Upstash's free-tier 500 messages/day cap.
+      // Retries are capped conservatively (2) for the same reason: transient
+      // failures still get one automatic retry, but we don't burn quota chasing
+      // deterministic failures.
+      try {
+        await getQStashClient().publishJSON({
+          url: resolveSyncWorkerUrl(),
+          retries: 2,
+          body: {
+            jobId: job.id,
             shop,
             trendsCode,
             region,
-            admin: adminClient,
-            productToSync: fullProduct,
+            productToSync,
             syncLocks: body.syncLocks,
             isMock: body.isMock,
             inventorySyncMode: body.inventorySyncMode,
             targetLocationId: body.targetLocationId,
             splitLocationIds: body.splitLocationIds,
-          });
-        } catch (workerErr) {
-          console.error(`[ProxyAction] Background worker error for job ${job.id}:`, workerErr);
-        }
-      })();
+          },
+        });
+      } catch (publishErr) {
+        const publishMessage =
+          publishErr instanceof Error ? publishErr.message : "Failed to queue sync job with QStash";
+        console.error(`[ProxyAction] QStash publish failed for job ${job.id}:`, publishErr);
 
-      // Support Vercel / serverless waitUntil if provided by the environment
-      if (context && typeof (context as any).waitUntil === "function") {
-        (context as any).waitUntil(workerPromise);
+        await prisma.trendSyncJob.update({
+          where: { id: job.id },
+          data: {
+            status: "FAILED",
+            stage: "FAILED",
+            errorMessage: publishMessage,
+            message: `Failed to queue sync job: ${publishMessage}`,
+          },
+        });
+
+        return Response.json(
+          { success: false, jobId: job.id, error: publishMessage },
+          { status: 502 }
+        );
       }
 
       // 3. Return immediate HTTP 202 Accepted (< 500ms) with job ID
