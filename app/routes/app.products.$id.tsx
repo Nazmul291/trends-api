@@ -939,14 +939,6 @@ export default function ProductDetailPage() {
             >
               {fetcher.state === "submitting" ? "Saving..." : "Save Location Rules"}
             </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              loading={syncStatus === "loading"}
-              onClick={handleSyncWithLocationOptions}
-            >
-              {syncStatus === "loading" ? "Syncing..." : isSynced ? "🔄 Re-sync Stock" : "Sync to Shopify"}
-            </Button>
           </div>
         </div>
 
