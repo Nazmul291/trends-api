@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import type { LoaderFunctionArgs, ActionFunctionArgs } from "react-router";
-import { useParams, useNavigate, useLoaderData, useFetcher } from "react-router";
+import { Link, useParams, useNavigate, useLoaderData, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getAppSettings } from "../../server/settings/app-settings.service";
@@ -1008,9 +1008,9 @@ export default function ProductDetailPage() {
             </div>
             <span style={{ fontSize: "12px", color: "#6d7175" }}>
               To change storewide rules, visit{" "}
-              <a href="/app/settings" style={{ color: "#008060", fontWeight: 600 }}>
+              <Link to="/app/settings" style={{ color: "#008060", fontWeight: 600 }}>
                 Settings
-              </a>
+              </Link>
               .
             </span>
           </div>
