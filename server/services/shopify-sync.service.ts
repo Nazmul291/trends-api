@@ -714,6 +714,18 @@ export function toValidShopifyLocationGid(locId: unknown): string | null {
 }
 
 /**
+ * Checks whether a value is a genuine Shopify Product GID (e.g.
+ * "gid://shopify/Product/123456789"), as opposed to a local placeholder like
+ * "pending-sync-100144" written by callers that create a TrendProductSync row
+ * before the product actually exists in Shopify (e.g. saving an inventory
+ * location override ahead of the first sync). `productUpdate` rejects anything
+ * else, so callers must never pass a non-matching value to it.
+ */
+export function isValidShopifyProductGid(id: unknown): id is string {
+  return typeof id === "string" && /^gid:\/\/shopify\/Product\/\d+$/.test(id);
+}
+
+/**
  * Safely executes a Shopify GraphQL operation with automatic cost-throttle inspection and backoff.
  */
 export async function executeShopifyGraphql<T = any>(
@@ -1589,6 +1601,28 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
 
   let shopifyProductId = existingSync?.shopifyProductId;
   let shopifyHandle: string | undefined;
+  // Whether this call actually ran productCreate (vs. finding/updating an
+  // existing Shopify product) — used for the final "created"/"updated" label,
+  // since `existingSync` alone can't tell (a self-healed placeholder row has
+  // a DB record but no real Shopify product yet). Defaults to the pre-existing
+  // "no DB record at all" rule for the offline/mock path below, which never
+  // reaches the `admin`-gated block that resolves this more precisely.
+  let isNewProductCreation = !existingSync;
+
+  // The DB record may hold a local placeholder (e.g. "pending-sync-100144",
+  // written when an inventory override is saved before the product's first
+  // sync) instead of a genuine Shopify GID. productUpdate rejects anything
+  // that isn't "gid://shopify/Product/<id>", so treat a placeholder/invalid
+  // value as "not yet created in Shopify" — this routes us into the CREATE
+  // branch below (which itself re-checks Shopify by tag first, in case the
+  // product actually already exists there) instead of calling productUpdate
+  // with a bogus id.
+  if (shopifyProductId && !isValidShopifyProductGid(shopifyProductId)) {
+    console.warn(
+      `[Shopify Sync] Discarding non-GID shopifyProductId "${shopifyProductId}" for trends code ${trendsCode} — treating product as uncreated in Shopify.`
+    );
+    shopifyProductId = undefined;
+  }
 
   // Resolve effective inventory distribution strategy:
   // 1. Explicit options passed to syncTrendProductToShopify (if any)
@@ -1809,11 +1843,16 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
         : []),
     ];
 
+    // Captured here (not re-derived from `existingSync` later) so a self-healed
+    // placeholder row — which has a DB record but no real Shopify product yet —
+    // is correctly reported as "created", not "updated".
+    isNewProductCreation = !shopifyProductId;
+
     if (options.onProgress) {
       await options.onProgress({
         stage: "STAGE_1_PRODUCT_VARIANTS",
         progress: 25,
-        message: !shopifyProductId
+        message: isNewProductCreation
           ? "Creating product and provisioning variant matrix in Shopify..."
           : "Updating product details and synchronizing variant matrix in Shopify...",
       });
@@ -2397,32 +2436,51 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
   }
 
   // 4. Persist record in PostgreSQL Sync Ledger
-  const action: "created" | "updated" = existingSync ? "updated" : "created";
+  const action: "created" | "updated" = isNewProductCreation ? "created" : "updated";
 
-  const savedSync = await prisma.trendProductSync.upsert({
-    where: {
-      shopifyProductId: resolvedShopifyProductId,
-    },
-    create: {
-      shop,
-      shopifyProductId: resolvedShopifyProductId,
-      trendsCode,
-      region: normalizedRegion,
-      syncLocks,
-      lastSyncedAt: new Date(),
-      ...(explicitMode !== undefined ? { inventorySyncMode: explicitMode } : {}),
-      ...(explicitTargetLoc !== undefined ? { targetLocationId: explicitTargetLoc } : {}),
-      ...(explicitSplitLocs !== undefined ? { splitLocationIds: explicitSplitLocs } : {}),
-    },
-    update: {
-      region: normalizedRegion,
-      syncLocks,
-      lastSyncedAt: new Date(),
-      ...(explicitMode !== undefined ? { inventorySyncMode: explicitMode } : {}),
-      ...(explicitTargetLoc !== undefined ? { targetLocationId: explicitTargetLoc } : {}),
-      ...(explicitSplitLocs !== undefined ? { splitLocationIds: explicitSplitLocs } : {}),
-    },
-  });
+  // Self-healing: when a DB row already exists (e.g. a placeholder written by
+  // an inventory override saved before the first sync), update that exact row
+  // by its own id so the real Shopify GID overwrites the placeholder in place.
+  // Upserting by `shopifyProductId` instead would miss it entirely here — the
+  // placeholder never matches `resolvedShopifyProductId` — and create a second,
+  // orphaned row, silently losing whatever overrides were saved on the first.
+  const savedSync = existingSync
+    ? await prisma.trendProductSync.update({
+        where: { id: existingSync.id },
+        data: {
+          shopifyProductId: resolvedShopifyProductId,
+          region: normalizedRegion,
+          syncLocks,
+          lastSyncedAt: new Date(),
+          ...(explicitMode !== undefined ? { inventorySyncMode: explicitMode } : {}),
+          ...(explicitTargetLoc !== undefined ? { targetLocationId: explicitTargetLoc } : {}),
+          ...(explicitSplitLocs !== undefined ? { splitLocationIds: explicitSplitLocs } : {}),
+        },
+      })
+    : await prisma.trendProductSync.upsert({
+        where: {
+          shopifyProductId: resolvedShopifyProductId,
+        },
+        create: {
+          shop,
+          shopifyProductId: resolvedShopifyProductId,
+          trendsCode,
+          region: normalizedRegion,
+          syncLocks,
+          lastSyncedAt: new Date(),
+          ...(explicitMode !== undefined ? { inventorySyncMode: explicitMode } : {}),
+          ...(explicitTargetLoc !== undefined ? { targetLocationId: explicitTargetLoc } : {}),
+          ...(explicitSplitLocs !== undefined ? { splitLocationIds: explicitSplitLocs } : {}),
+        },
+        update: {
+          region: normalizedRegion,
+          syncLocks,
+          lastSyncedAt: new Date(),
+          ...(explicitMode !== undefined ? { inventorySyncMode: explicitMode } : {}),
+          ...(explicitTargetLoc !== undefined ? { targetLocationId: explicitTargetLoc } : {}),
+          ...(explicitSplitLocs !== undefined ? { splitLocationIds: explicitSplitLocs } : {}),
+        },
+      });
 
   // Track all variants in Prisma.
   // Bulk upsert in a single round trip instead of N sequential awaits: on a
@@ -2567,9 +2625,13 @@ export async function getTrendProductSyncStatuses(
 
   const map: Record<string, SyncStatusItem> = {};
   for (const record of syncRecords) {
-    const numericId = record.shopifyProductId.split("/").pop();
+    // A DB row can exist without the product actually being in Shopify yet —
+    // e.g. a placeholder ("pending-sync-...") written when an inventory
+    // override is saved before the first sync. Don't report those as synced.
+    const isSynced = isValidShopifyProductGid(record.shopifyProductId);
+    const numericId = isSynced ? record.shopifyProductId.split("/").pop() : undefined;
     map[record.trendsCode] = {
-      isSynced: true,
+      isSynced,
       shopifyProductId: record.shopifyProductId,
       shopifyNumericId: numericId,
       lastSyncedAt: record.lastSyncedAt.toISOString(),
