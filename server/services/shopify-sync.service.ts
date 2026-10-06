@@ -1670,12 +1670,24 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
   // 2. Ensure product has live stock data from Trends API stock endpoint (/api/v1/stock/{id}.json)
   if (trendsCode) {
     try {
-      const stockRes = await TrendsApiClient.request<any>(normalizedRegion, `stock/${trendsCode}`);
+      // MUST pass `settings` here — getRegionalUpstreamConfig only sees a DB-stored
+      // Trends API key (as opposed to one set directly as a raw Vercel env var)
+      // via `settings.trendsApiKey`. Omitting it made `hasCredentials` resolve to
+      // false whenever the key was configured only through the Settings page,
+      // silently triggering the mock-data fallback below — which, for any trends
+      // code not in the hardcoded mock catalog, falls back to mock product #1
+      // (3 stock items) regardless of what the real product actually has. This
+      // was the root cause of every "stuck at exactly 3 variants" symptom seen
+      // in this sync pipeline, independent of QStash/DB/GraphQL — those were
+      // real bugs too, but this is why variant count was wrong from the start.
+      const stockRes = await TrendsApiClient.request<any>(normalizedRegion, `stock/${trendsCode}`, {
+        settings: appSettings,
+      });
       const extractedStock = parseTrendsStockResponse(stockRes?.data);
       console.info(
         `[Shopify Sync Diagnostic] trends code ${trendsCode}: live stock/{code} endpoint returned ` +
-          `${Array.isArray(stockRes?.data) ? stockRes.data.length : typeof stockRes?.data} raw item(s), ` +
-          `parsed to ${extractedStock.length} stock item(s).`
+          `${Array.isArray(stockRes?.data) ? stockRes.data.length : typeof stockRes?.data} raw item(s) ` +
+          `(isMockFallback=${Boolean(stockRes?.isMockFallback)}), parsed to ${extractedStock.length} stock item(s).`
       );
       if (extractedStock.length > 0) {
         trendsProduct = {
@@ -2258,6 +2270,12 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
 
         const existingNodes = varQueryJson?.data?.product?.variants?.nodes || [];
 
+        console.info(
+          `[Shopify Sync Diagnostic] trends code ${trendsCode}: existing product ${shopifyProductId} currently ` +
+            `has ${existingNodes.length} variant(s) in Shopify (queried via variants(first: 250)). ` +
+            `Attempting to reconcile against ${normalizedSpecs.length} normalized spec(s).`
+        );
+
         const updatePayload: any[] = [];
         const missingSpecsToCreate: VariantSpec[] = [];
 
@@ -2292,11 +2310,18 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
           }
         }
 
+        console.info(
+          `[Shopify Sync Diagnostic] trends code ${trendsCode}: reconciliation result — ` +
+            `${updatePayload.length} spec(s) matched an existing Shopify variant (will update), ` +
+            `${missingSpecsToCreate.length} spec(s) have no match (will create). ` +
+            `${normalizedSpecs.length} - ${updatePayload.length} - ${missingSpecsToCreate.length} should equal 0.`
+        );
+
         // 1. Bulk update existing variants in chunks of 50
         const VARIANT_BATCH_SIZE = 50;
         for (let i = 0; i < updatePayload.length; i += VARIANT_BATCH_SIZE) {
           const chunk = updatePayload.slice(i, i + VARIANT_BATCH_SIZE);
-          await executeShopifyGraphql(
+          const updateRes = await executeShopifyGraphql(
             admin,
             `#graphql
             mutation updateExistingVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
@@ -2317,6 +2342,16 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
                 variants: chunk,
               },
             }
+          );
+
+          // This response was previously discarded entirely — any userErrors here
+          // (e.g. a stale/invalid variant id, a locked field) were invisible.
+          const updatedVariants = updateRes?.data?.productVariantsBulkUpdate?.productVariants || [];
+          const updateErrors = updateRes?.data?.productVariantsBulkUpdate?.userErrors || [];
+          console.info(
+            `[Shopify Sync Diagnostic] trends code ${trendsCode}: productVariantsBulkUpdate batch ` +
+              `${Math.floor(i / VARIANT_BATCH_SIZE) + 1} requested ${chunk.length}, Shopify updated ` +
+              `${updatedVariants.length}, ${updateErrors.length} userError(s): ${JSON.stringify(updateErrors)}`
           );
         }
 
@@ -2380,6 +2415,13 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
               );
 
               const createdNodes = createRes?.data?.productVariantsBulkCreate?.productVariants || [];
+              const createErrors = createRes?.data?.productVariantsBulkCreate?.userErrors || [];
+              console.info(
+                `[Shopify Sync Diagnostic] trends code ${trendsCode}: createMissingVariants batch ` +
+                  `${Math.floor(i / VARIANT_BATCH_SIZE) + 1} requested ${chunkInput.length}, Shopify created ` +
+                  `${createdNodes.length}, ${createErrors.length} userError(s): ${JSON.stringify(createErrors)}`
+              );
+
               for (const spec of chunk) {
                 const matched = createdNodes.find((cv: any) => cv.inventoryItem?.sku === spec.canonicalSku);
                 variantLedgerEntries.push({
@@ -2549,6 +2591,18 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
   // product with many variants, awaiting one upsert at a time added enough
   // cumulative DB latency to risk running past the serverless duration ceiling
   // (each round trip pays full network + statement overhead on its own).
+  const realGidLedgerCount = variantLedgerEntries.filter((v) =>
+    v.shopifyVariantId.startsWith("gid://shopify/ProductVariant/")
+  ).length;
+  console.info(
+    `[Shopify Sync Diagnostic] trends code ${trendsCode}: about to persist ${variantLedgerEntries.length} ` +
+      `ledger entry/entries to TrendVariantSync (requested ${normalizedSpecs.length} this call). Of those, ` +
+      `${realGidLedgerCount} have a real Shopify variant GID; the rest (${
+        variantLedgerEntries.length - realGidLedgerCount
+      }) are local fallback ids written when Shopify didn't return a matching variant — these do NOT mean the ` +
+      `variant actually exists in Shopify.`
+  );
+
   if (variantLedgerEntries.length > 0) {
     // Guard against ON CONFLICT targeting the same row twice within one statement
     // (Postgres rejects that) by keeping only the last entry per variant, matching
