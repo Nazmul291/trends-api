@@ -1,0 +1,69 @@
+{
+  "payload": {
+    "export": "run",
+    "target": "purchase.product-discount.run",
+    "input": {
+      "cart": {
+        "lines": [
+          {
+            "id": "gid://shopify/CartLine/1",
+            "quantity": 60,
+            "cost": {
+              "amountPerQuantity": { "amount": "4.00" }
+            },
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "id": "gid://shopify/ProductVariant/1",
+              "product": {
+                "id": "gid://shopify/Product/1",
+                "metafield": {
+                  "value": "[{\"minQuantity\":100,\"price\":3.34}]"
+                }
+              }
+            }
+          },
+          {
+            "id": "gid://shopify/CartLine/2",
+            "quantity": 40,
+            "cost": {
+              "amountPerQuantity": { "amount": "4.00" }
+            },
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "id": "gid://shopify/ProductVariant/2",
+              "product": {
+                "id": "gid://shopify/Product/1",
+                "metafield": {
+                  "value": "[{\"minQuantity\":100,\"price\":3.34}]"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "output": {
+      "discountApplicationStrategy": "ALL",
+      "discounts": [
+        {
+          "message": "Volume pricing: 100+ units at $3.34/unit",
+          "targets": [
+            { "cartLine": { "id": "gid://shopify/CartLine/1" } }
+          ],
+          "value": {
+            "fixedAmount": { "amount": "0.66", "appliesToEachItem": true }
+          }
+        },
+        {
+          "message": "Volume pricing: 100+ units at $3.34/unit",
+          "targets": [
+            { "cartLine": { "id": "gid://shopify/CartLine/2" } }
+          ],
+          "value": {
+            "fixedAmount": { "amount": "0.66", "appliesToEachItem": true }
+          }
+        }
+      ]
+    }
+  }
+}

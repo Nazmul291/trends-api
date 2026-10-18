@@ -1,0 +1,4 @@
+{
+  "name": "Trends Volume Pricing",
+  "description": "Applies quantity-break discounts from each product's custom.volume_pricing metafield at checkout."
+}

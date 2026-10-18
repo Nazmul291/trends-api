@@ -1,0 +1,15 @@
+{
+  "payload": {
+    "export": "run",
+    "target": "purchase.product-discount.run",
+    "input": {
+      "cart": {
+        "lines": []
+      }
+    },
+    "output": {
+      "discountApplicationStrategy": "FIRST",
+      "discounts": []
+    }
+  }
+}

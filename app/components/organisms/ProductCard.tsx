@@ -285,6 +285,48 @@ export const ProductCard: React.FC<ProductCardProps> = ({
                     </svg>
                   </a>
                 )}
+                {onSync && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onSync(product);
+                    }}
+                    disabled={isSyncing}
+                    title="Re-sync product from Trends API (refreshes pricing, options, and variants)"
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      width: "28px",
+                      height: "28px",
+                      borderRadius: "6px",
+                      border: "1px solid #008060",
+                      backgroundColor: isSyncing ? "#e3f1df" : "#ffffff",
+                      color: "#008060",
+                      cursor: isSyncing ? "not-allowed" : "pointer",
+                      transition: "all 0.15s ease",
+                      padding: 0,
+                    }}
+                  >
+                    {isSyncing ? (
+                      <span
+                        style={{
+                          width: "12px",
+                          height: "12px",
+                          border: "2px solid #008060",
+                          borderTopColor: "transparent",
+                          borderRadius: "50%",
+                          animation: "trends-spin 0.6s linear infinite",
+                        }}
+                      />
+                    ) : (
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+                      </svg>
+                    )}
+                  </button>
+                )}
                 {onDelete && (
                   <button
                     type="button"

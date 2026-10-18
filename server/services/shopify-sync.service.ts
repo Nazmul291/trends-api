@@ -157,6 +157,49 @@ export function extractBasePrice(product: ProductData, region: Region): string {
   return (regionalDefaults[region] || 15.00).toFixed(2);
 }
 
+export interface VolumePricingTier {
+  minQuantity: number;
+  price: number;
+}
+
+/**
+ * Builds the normalized volume-pricing tier list for the `custom.volume_pricing`
+ * product metafield, consumed by the tiered-discount-function Shopify Function
+ * at checkout. Reads whatever dynamic quantity breaks the Trends API returned
+ * for this product this sync — never hardcoded — so re-syncing always refreshes
+ * tiers to the supplier's current pricing.
+ */
+export function buildVolumePricingTiers(product: ProductData): VolumePricingTier[] {
+  const tiers: VolumePricingTier[] = [];
+
+  for (const group of normalizePricing(product.pricing)) {
+    for (const p of group.prices || []) {
+      const minQuantity = typeof p.quantity === "number" ? p.quantity : parseFloat(String(p.quantity));
+      const price = typeof p.price === "number" ? p.price : parseFloat(String(p.price));
+
+      if (Number.isFinite(minQuantity) && minQuantity > 0 && Number.isFinite(price) && price >= 0) {
+        tiers.push({ minQuantity, price });
+      }
+    }
+  }
+
+  // De-dupe by minQuantity (keep the lowest price seen for a given threshold,
+  // in case multiple pricing groups overlap) and sort ascending for readability
+  // in the Shopify admin metafield editor — the Function itself re-sorts
+  // descending when evaluating, so storage order isn't functionally load-bearing.
+  const byMinQuantity = new Map<number, number>();
+  for (const tier of tiers) {
+    const existing = byMinQuantity.get(tier.minQuantity);
+    if (existing === undefined || tier.price < existing) {
+      byMinQuantity.set(tier.minQuantity, tier.price);
+    }
+  }
+
+  return Array.from(byMinQuantity.entries())
+    .map(([minQuantity, price]) => ({ minQuantity, price }))
+    .sort((a, b) => a.minQuantity - b.minQuantity);
+}
+
 /**
  * Sanitizes image URL ensuring an absolute https protocol
  */
@@ -834,6 +877,12 @@ export async function syncInventoryQuantities(
   locationId: string,
   items: InventorySyncItem[]
 ): Promise<void> {
+  console.info(
+    `[Sync Location Audit] syncInventoryQuantities: fallback locationId=${JSON.stringify(locationId)}, ` +
+      `received ${items.length} inventory item/allocation(s). Per-item locationIds present: ` +
+      `${JSON.stringify(Array.from(new Set(items.map((it) => it.locationId || locationId))))}`
+  );
+
   // 1. Validate items
   const validItems = items.filter((it) => {
     if (!it.inventoryItemId || typeof it.inventoryItemId !== "string") return false;
@@ -858,6 +907,13 @@ export async function syncInventoryQuantities(
         inventoryItemId: item.inventoryItemId,
         locationId: validLoc,
         quantity: Math.max(0, parseInt(String(item.quantity), 10) || 0),
+        // Explicitly skips Shopify's compare-and-swap check (per
+        // InventoryQuantityInput.changeFromQuantity docs: passing null means
+        // "don't compare against the currently persisted quantity, just set
+        // it" — this app is the source of truth for these quantities). This is
+        // NOT a bug — using a real compareQuantity here would itself cause
+        // exactly this kind of "some items silently don't update" symptom for
+        // any item whose persisted quantity doesn't match what we guess it is.
         changeFromQuantity: null,
       };
     })
@@ -871,10 +927,24 @@ export async function syncInventoryQuantities(
     return;
   }
 
+  console.info(
+    `[Shopify Sync Diagnostic] syncInventoryQuantities: ${quantitiesInput.length} of ${items.length} item(s) ` +
+      `passed validation and have a resolvable location GID.`
+  );
+
   // 3. Batch inventorySetQuantities mutation in chunks of up to 100 items (Shopify allows up to 250 quantities per mutation)
   const BATCH_SIZE = 100;
+  let totalConfirmed = 0;
+  let totalStillFailing = 0;
+
   for (let i = 0; i < quantitiesInput.length; i += BATCH_SIZE) {
     const chunkQuantities = quantitiesInput.slice(i, i + BATCH_SIZE);
+    const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
+
+    console.info(
+      `[Sync Location Audit] Setting quantities for batch ${batchNumber}: total items: ${chunkQuantities.length}, ` +
+        `strictly for location(s): ${JSON.stringify(Array.from(new Set(chunkQuantities.map((q) => q.locationId))))}`
+    );
 
     try {
       const setJson = await executeShopifyGraphql(
@@ -892,6 +962,7 @@ export async function syncInventoryQuantities(
             userErrors {
               field
               message
+              code
             }
           }
         }`,
@@ -908,9 +979,15 @@ export async function syncInventoryQuantities(
       );
 
       const topErrors = setJson?.errors || [];
-      const userErrors: Array<{ field?: string[]; message: string }> =
+      const userErrors: Array<{ field?: string[]; message: string; code?: string }> =
         setJson?.data?.inventorySetQuantities?.userErrors || [];
       const changes = setJson?.data?.inventorySetQuantities?.inventoryAdjustmentGroup?.changes || [];
+
+      console.info(
+        `[Shopify Sync Diagnostic] inventorySetQuantities batch ${batchNumber}: requested ` +
+          `${chunkQuantities.length} item(s), Shopify confirmed ${changes.length} change(s), ` +
+          `${userErrors.length} userError(s).`
+      );
 
       if (topErrors.length > 0 || userErrors.length > 0) {
         const allErrors = [...topErrors, ...userErrors];
@@ -919,18 +996,48 @@ export async function syncInventoryQuantities(
           formatGraphQLErrors(allErrors)
         );
 
+        // Shopify's userErrors report which array index failed via a `field`
+        // path containing the numeric index somewhere (e.g.
+        // ["quantities", "2", "inventoryItemId"]) — scan for the first purely
+        // numeric segment rather than assuming a fixed position, since the
+        // exact prefix isn't guaranteed. Use this to retry only the specific
+        // items that actually failed, and to know exactly which
+        // inventoryItemIds remain at stake, rather than blindly re-activating
+        // and re-sending the entire batch (including items that already
+        // succeeded).
+        const failedIndexes = new Set<number>();
+        for (const err of userErrors) {
+          const numericSegment = err.field?.find((seg) => /^\d+$/.test(seg));
+          const idx = numericSegment !== undefined ? parseInt(numericSegment, 10) : NaN;
+          if (!isNaN(idx)) {
+            failedIndexes.add(idx);
+          }
+        }
+        // Fall back to treating the whole batch as "at risk" if Shopify didn't
+        // give us per-item field paths to work with.
+        const failedItems =
+          failedIndexes.size > 0
+            ? chunkQuantities.filter((_, idx) => failedIndexes.has(idx))
+            : chunkQuantities;
+
+        console.warn(
+          `[Shopify Sync Diagnostic] ${failedItems.length} of ${chunkQuantities.length} item(s) in batch ` +
+            `${batchNumber} failed: ${JSON.stringify(failedItems.map((f) => f.inventoryItemId))}`
+        );
+
         // Check if any error is due to unstocked items at location
         const unstockedItemErrors = userErrors.filter(
           (u) =>
+            u.code === "INVALID_LOCATION" ||
             u.message?.toLowerCase().includes("not stocked") ||
             u.message?.toLowerCase().includes("location") ||
             u.message?.toLowerCase().includes("tracked")
         );
 
         if (unstockedItemErrors.length > 0) {
-          // Identify unstocked items and activate them in parallel
+          // Identify unstocked items (only — not the whole batch) and activate them
           const itemsToActivateMap = new Map<string, Set<string>>();
-          for (const item of chunkQuantities) {
+          for (const item of failedItems) {
             if (!itemsToActivateMap.has(item.inventoryItemId)) {
               itemsToActivateMap.set(item.inventoryItemId, new Set());
             }
@@ -968,9 +1075,16 @@ export async function syncInventoryQuantities(
             })
           );
 
-          // Retry inventorySetQuantities ONCE in a single batch
+          // Give Shopify a moment to finish propagating the activation before
+          // retrying — immediately retrying a just-created inventory item's
+          // location connection can race ahead of Shopify's own indexing,
+          // which would otherwise fail the retry too for no visible reason.
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+
+          // Retry inventorySetQuantities ONCE, scoped to only the items that
+          // actually failed — and, unlike before, actually read the response.
           try {
-            await executeShopifyGraphql(
+            const retryJson = await executeShopifyGraphql(
               admin,
               `#graphql
               mutation retryInventorySetQuantities($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
@@ -984,6 +1098,7 @@ export async function syncInventoryQuantities(
                   userErrors {
                     field
                     message
+                    code
                   }
                 }
               }`,
@@ -992,25 +1107,62 @@ export async function syncInventoryQuantities(
                   input: {
                     name: "available",
                     reason: "correction",
-                    quantities: chunkQuantities,
+                    quantities: failedItems,
                   },
                   idempotencyKey: randomUUID(),
                 },
               }
             );
+
+            const retryUserErrors = retryJson?.data?.inventorySetQuantities?.userErrors || [];
+            const retryChanges = retryJson?.data?.inventorySetQuantities?.inventoryAdjustmentGroup?.changes || [];
+
+            totalConfirmed += retryChanges.length;
+
+            if (retryUserErrors.length > 0) {
+              totalStillFailing += failedItems.length - retryChanges.length;
+              console.error(
+                `[Shopify Sync Diagnostic] Retry STILL failing for ${failedItems.length - retryChanges.length} ` +
+                  `of ${failedItems.length} item(s) after activation + retry. Affected inventoryItemIds: ` +
+                  `${JSON.stringify(failedItems.map((f) => f.inventoryItemId))}. userErrors: ` +
+                  `${JSON.stringify(retryUserErrors)}`
+              );
+            } else {
+              console.info(
+                `[Shopify Sync Diagnostic] Retry succeeded for all ${retryChanges.length} previously-failing item(s).`
+              );
+            }
           } catch (retryErr) {
-            console.warn("[Shopify Sync] Retry inventorySetQuantities warning:", retryErr);
+            totalStillFailing += failedItems.length;
+            console.error(
+              `[Shopify Sync Diagnostic] Retry inventorySetQuantities threw for inventoryItemIds ` +
+                `${JSON.stringify(failedItems.map((f) => f.inventoryItemId))}:`,
+              retryErr
+            );
           }
+        } else {
+          // Errors weren't about unstocked items, so there was no activation
+          // path to retry through — these items are still unresolved.
+          totalStillFailing += failedItems.length;
         }
+
+        totalConfirmed += changes.length;
       } else {
+        totalConfirmed += changes.length;
         console.info(
           `[Sync Logger] Successfully updated inventory for ${chunkQuantities.length} allocation(s). Stock adjustments: ${changes.length}`
         );
       }
     } catch (setErr) {
+      totalStillFailing += chunkQuantities.length;
       console.warn("[Shopify Sync] inventorySetQuantities batch error:", formatGraphQLErrors(setErr));
     }
   }
+
+  console.info(
+    `[Shopify Sync Diagnostic] syncInventoryQuantities summary: ${quantitiesInput.length} item(s) requested, ` +
+      `${totalConfirmed} confirmed changed by Shopify, ${totalStillFailing} still unresolved after retries.`
+  );
 }
 
 // ==========================================
@@ -1654,12 +1806,34 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
     (existingSync?.inventorySyncMode as "single" | "split_equal" | null) ||
     appSettings.inventorySyncMode ||
     "single";
+  // NOTE: this must be a truthiness check, not `!== undefined`. Prisma returns
+  // `null` (not `undefined`) for an unset nullable column, and most products
+  // never get a per-product targetLocationId override — so `existingSync`
+  // (which exists on every re-sync, not just ones with an override) almost
+  // always has `targetLocationId: null`. An `!== undefined` check treats that
+  // stored `null` as "an explicit value to use," short-circuiting before ever
+  // reaching appSettings.targetLocationId below — silently discarding the
+  // merchant's configured Settings location on every re-sync and falling
+  // through to allocateStockAcrossLocations' heuristic fallback location
+  // instead. `null`/`undefined`/empty-string must all mean "no override at
+  // this level, check the next one," exactly like effectiveMode above.
   const effectiveTargetLocationId: string | null =
-    explicitTargetLoc !== undefined
-      ? explicitTargetLoc
-      : existingSync?.targetLocationId !== undefined
-      ? existingSync.targetLocationId
-      : appSettings.targetLocationId || null;
+    explicitTargetLoc || existingSync?.targetLocationId || appSettings.targetLocationId || null;
+
+  console.info(
+    `[Sync Location Audit] trends code ${trendsCode}: effectiveMode=${effectiveMode}, ` +
+      `effectiveTargetLocationId=${JSON.stringify(effectiveTargetLocationId)} ` +
+      `(source: ${
+        explicitTargetLoc
+          ? "explicit option"
+          : existingSync?.targetLocationId
+          ? "per-product DB override"
+          : appSettings.targetLocationId
+          ? "global App Settings"
+          : "none configured — will fall back to heuristic location resolution"
+      }), isValidGid=${effectiveTargetLocationId ? Boolean(toValidShopifyLocationGid(effectiveTargetLocationId)) : "n/a"}`
+  );
+
   const effectiveSplitLocationIds: string[] =
     explicitSplitLocs !== undefined
       ? explicitSplitLocs
@@ -1867,6 +2041,16 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
         key: "quantity_breaks",
         type: "json",
         value: JSON.stringify(normalizePricing(trendsProduct.pricing)[0]?.prices || []),
+      },
+      // Consumed at checkout by extensions/tiered-discount-function (Shopify
+      // Function, purchase.product-discount.run target) — namespace/key must
+      // match its run.graphql input query exactly. Refreshed on every sync, so
+      // re-syncing a product always picks up the supplier's current tiers.
+      {
+        namespace: "custom",
+        key: "volume_pricing",
+        type: "json",
+        value: JSON.stringify(buildVolumePricingTiers(trendsProduct)),
       },
       {
         namespace: "trends",
