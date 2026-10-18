@@ -1,0 +1,7 @@
+# Shopify Function extensions are compiled to Wasm and deployed to Shopify's
+# own infrastructure via `shopify app deploy` — never by Vercel. Keep them
+# (and the pnpm workspace tooling they bring along) out of Vercel's build
+# context entirely so Vercel never has a reason to touch pnpm.
+extensions/
+pnpm-lock.yaml
+pnpm-workspace.yaml
