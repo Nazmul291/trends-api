@@ -530,8 +530,8 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
       splitLocationIds?: string[];
     }
   ) => {
-    const targetProduct = productOverride || get().product;
-    if (!targetProduct) {
+    const baseProduct = productOverride || get().product;
+    if (!baseProduct) {
       set({
         syncStatus: "error",
         syncError: "No product selected to sync to Shopify",
@@ -545,8 +545,28 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
       syncError: null,
       syncStage: "QUEUED",
       syncProgress: 5,
-      syncMessage: "Initiating background sync job...",
+      syncMessage: "Fetching latest product data from TRENDS API...",
     });
+
+    // "Resync to Shopify" exists specifically to push the LATEST upstream
+    // data — reusing whatever happened to already be in the store (from
+    // page load, capped at productShowTtl = 2h server-side cache, or from a
+    // catalog-list row, capped at productsListTtl = 1h and missing full
+    // detail fields besides) would defeat the entire point of a manual
+    // resync. fetchProduct's own bypassCache option already existed for
+    // exactly this but was never wired up here — this is that wiring.
+    await get().fetchProduct(baseProduct.code, { bypassCache: true });
+    if (get().productStatus === "error") {
+      set({
+        syncStatus: "error",
+        syncError: get().productError || "Failed to fetch the latest product data before syncing",
+        syncProgress: 0,
+      });
+      return false;
+    }
+    const targetProduct = get().product || baseProduct;
+
+    set({ syncMessage: "Initiating background sync job..." });
 
     try {
       const res = await fetch(`/api/proxy/${region}/sync-product`, {
@@ -556,6 +576,11 @@ export const useProductDetailStore = create<ProductDetailState>((set, get) => ({
           productId: targetProduct.code,
           product: targetProduct,
           region,
+          // Belt-and-suspenders: tells the server to ignore `product` above
+          // and do its own live upstream fetch too, so a future caller that
+          // forgets to bypass the client-side cache still can't push stale
+          // data through.
+          forceRefresh: true,
           ...(locationOptions?.inventorySyncMode
             ? { inventorySyncMode: locationOptions.inventorySyncMode }
             : {}),

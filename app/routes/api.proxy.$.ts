@@ -426,14 +426,15 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         inventorySyncMode?: "single" | "split_equal";
         targetLocationId?: string | null;
         splitLocationIds?: string[];
+        forceRefresh?: boolean;
       };
 
-      let productToSync = body.product || body.trendsProduct;
+      let productToSync = body.forceRefresh ? undefined : body.product || body.trendsProduct;
       if (Array.isArray(productToSync)) {
         productToSync = productToSync[0];
       }
 
-      const trendsCode = String(body.productId || productToSync?.code || "").trim();
+      const trendsCode = String(body.productId || body.product?.code || body.trendsProduct?.code || "").trim();
       if (!trendsCode) {
         return Response.json(
           { success: false, error: "Missing product data or productId for synchronization" },
@@ -444,6 +445,13 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       // Resolve the full product payload up front (not deferred to the worker) —
       // we need it either way: to hand to QStash, and to compute the variant
       // chunk plan if QStash dispatch fails and we fall back to client-driven sync.
+      //
+      // Defense in depth: `forceRefresh` (set by the "Resync to Shopify"
+      // button) deliberately discards whatever `product`/`trendsProduct`
+      // the client sent above, forcing this branch to run — an uncached,
+      // direct upstream TrendsApiClient call — so a caller that forgets to
+      // bypass its own client-side cache can't silently push stale data
+      // through regardless.
       if (!productToSync) {
         try {
           const showRes = await TrendsApiClient.request<ProductShowData>(

@@ -4,6 +4,7 @@ import { Link, useParams, useNavigate, useLoaderData, useFetcher } from "react-r
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getAppSettings } from "../../server/settings/app-settings.service";
+import { isValidShopifyProductGid } from "../../server/services/shopify-sync.service";
 import { useProductDetailStore } from "../stores/useProductDetailStore";
 import { useRegionStore } from "../stores/useRegionStore";
 import { StatusBadge } from "../components/atoms/StatusBadge";
@@ -119,6 +120,30 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
 
   const primaryLocId = locations.find((l) => l.isPrimary)?.id || locations[0]?.id || "";
 
+  // 4. Resolve the storefront URL for the "View Storefront" action — only
+  // once we know of an actual synced Shopify product (not a
+  // "pending-sync-..." placeholder GID). onlineStoreUrl is null when the
+  // product isn't published to the Online Store sales channel, so the
+  // button below only renders when this comes back non-null.
+  let shopifyProductUrl: string | null = null;
+  if (productSync && isValidShopifyProductGid(productSync.shopifyProductId)) {
+    try {
+      const productRes = await admin.graphql(
+        `#graphql
+        query getProductStorefrontUrl($id: ID!) {
+          product(id: $id) {
+            onlineStoreUrl
+          }
+        }`,
+        { variables: { id: productSync.shopifyProductId } }
+      );
+      const productJson = await productRes.json();
+      shopifyProductUrl = productJson?.data?.product?.onlineStoreUrl || null;
+    } catch (err) {
+      console.warn("[ProductDetails] Failed to fetch storefront URL:", err);
+    }
+  }
+
   return {
     shop,
     locations,
@@ -133,6 +158,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
           lastSyncedAt: productSync.lastSyncedAt ? productSync.lastSyncedAt.toISOString() : null,
         }
       : null,
+    shopifyProductUrl,
   };
 };
 
@@ -225,6 +251,7 @@ export default function ProductDetailPage() {
     splitLocationIds: [],
   };
   const productSync = loaderData?.productSync;
+  const shopifyProductUrl = loaderData?.shopifyProductUrl || null;
 
   const fetcher = useFetcher<typeof action>();
 
@@ -446,51 +473,62 @@ export default function ProductDetailPage() {
           <StatusBadge label={`Region: ${currentRegion.toUpperCase()}`} tone="info" size="sm" />
           <StatusBadge label={`Code: ${product.code}`} tone="neutral" size="sm" />
 
-          {isSynced && (
-            <>
-              <StatusBadge label="✓ Synced to Shopify" tone="success" size="sm" />
-              {adminProductUrl && (
-                <a
-                  href={adminProductUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: "4px",
-                    padding: "6px 12px",
-                    borderRadius: "8px",
-                    backgroundColor: "#f1f8f5",
-                    color: "#008060",
-                    border: "1px solid #cbe5d8",
-                    fontSize: "12px",
-                    fontWeight: 600,
-                    textDecoration: "none",
-                    transition: "all 0.15s ease",
-                  }}
-                >
-                  View in Admin ↗
-                </a>
-              )}
-              <Button
-                variant="destructive"
-                size="sm"
-                loading={deleteStatus === "loading"}
-                onClick={handleDeleteProduct}
-                icon={
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <polyline points="3 6 5 6 21 6" />
-                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-                  </svg>
-                }
-              >
-                {deleteStatus === "loading" ? "Deleting..." : "Delete from Shopify"}
-              </Button>
-            </>
+          {isSynced && <StatusBadge label="✓ Synced to Shopify" tone="success" size="sm" />}
+
+          {/* Button order is deliberate: View in Admin -> View Storefront ->
+              Resync -> Delete. The first, second, and fourth only make
+              sense once there's an actual Shopify product to link to/act on. */}
+          {isSynced && adminProductUrl && (
+            <a
+              href={adminProductUrl}
+              target="_blank"
+              rel="noreferrer"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "4px",
+                padding: "6px 12px",
+                borderRadius: "8px",
+                backgroundColor: "#f1f8f5",
+                color: "#008060",
+                border: "1px solid #cbe5d8",
+                fontSize: "12px",
+                fontWeight: 600,
+                textDecoration: "none",
+                transition: "all 0.15s ease",
+              }}
+            >
+              View in Admin ↗
+            </a>
           )}
-          {/* Always rendered — even once synced — so pricing/options/variant
-              updates from the Trends API can be pulled in at any time without
-              needing to delete and recreate the product. */}
+
+          {isSynced && shopifyProductUrl && (
+            <a
+              href={shopifyProductUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "4px",
+                padding: "6px 12px",
+                borderRadius: "8px",
+                backgroundColor: "#eff6ff",
+                color: "#1d4ed8",
+                border: "1px solid #bfdbfe",
+                fontSize: "12px",
+                fontWeight: 600,
+                textDecoration: "none",
+                transition: "all 0.15s ease",
+              }}
+            >
+              View Storefront ↗
+            </a>
+          )}
+
+          {/* Always rendered — even when not yet synced — so pricing/options/
+              variant updates from the Trends API can be pulled in at any
+              time without needing to delete and recreate the product. */}
           <Button
             variant={isSynced ? "outline" : "primary"}
             size="sm"
@@ -508,6 +546,23 @@ export default function ProductDetailPage() {
               ? "Re-sync to Shopify"
               : "Sync to Shopify"}
           </Button>
+
+          {isSynced && (
+            <Button
+              variant="destructive"
+              size="sm"
+              loading={deleteStatus === "loading"}
+              onClick={handleDeleteProduct}
+              icon={
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="3 6 5 6 21 6" />
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                </svg>
+              }
+            >
+              {deleteStatus === "loading" ? "Deleting..." : "Delete from Shopify"}
+            </Button>
+          )}
         </div>
       </div>
 
