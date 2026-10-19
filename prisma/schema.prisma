@@ -118,6 +118,30 @@ model AppSettings {
   updatedAt               DateTime @updatedAt
 }
 
+/// One active dynamic, single-use volume-pricing discount code per cart.
+/// Standard (non-Plus) plans can't register the tiered-discount-function as a
+/// live automatic discount, so this is the fallback: the storefront script
+/// re-evaluates the cart on every mutation and this table tracks whichever
+/// code is currently live for that cart, so it can be looked up and deleted
+/// from Shopify the instant the cart changes again.
+model VolumeDiscountCode {
+  id                String   @id @default(uuid())
+  shop              String
+  cartToken         String
+  discountNodeId    String
+  code              String
+  amount            String
+  /// The cart-wide quantity this code's amount/minimumRequirement was computed against —
+  /// lets syncCartDiscount detect "nothing actually changed" and skip re-issuing a code.
+  totalCartQuantity Int
+  expiresAt         DateTime
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([shop, cartToken])
+  @@index([expiresAt])
+}
+
 model TrendSyncJob {
   id           String    @id @default(uuid())
   shop         String

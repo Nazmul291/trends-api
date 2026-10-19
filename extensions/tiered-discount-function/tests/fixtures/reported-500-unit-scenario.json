@@ -1,0 +1,43 @@
+{
+  "payload": {
+    "export": "run",
+    "target": "purchase.product-discount.run",
+    "input": {
+      "cart": {
+        "lines": [
+          {
+            "id": "gid://shopify/CartLine/1",
+            "quantity": 500,
+            "cost": {
+              "amountPerQuantity": { "amount": "3.34" }
+            },
+            "merchandise": {
+              "__typename": "ProductVariant",
+              "id": "gid://shopify/ProductVariant/1",
+              "product": {
+                "id": "gid://shopify/Product/1",
+                "metafield": {
+                  "value": "[{\"minQuantity\":100,\"price\":3.34},{\"minQuantity\":300,\"price\":3.28},{\"minQuantity\":500,\"price\":3.21}]"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "output": {
+      "discountApplicationStrategy": "ALL",
+      "discounts": [
+        {
+          "message": "Volume pricing: 500+ units at $3.21/unit",
+          "targets": [
+            { "cartLine": { "id": "gid://shopify/CartLine/1" } }
+          ],
+          "value": {
+            "fixedAmount": { "amount": "0.13", "appliesToEachItem": true }
+          }
+        }
+      ]
+    }
+  }
+}

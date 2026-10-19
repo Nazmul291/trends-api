@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  qs: ^6.16.0
+
 importers:
 
   .:
@@ -136,6 +139,8 @@ importers:
       vitest:
         specifier: ^3.2.4
         version: 3.2.7(@types/node@22.20.5)(jiti@2.7.0)(supports-color@7.2.0)(yaml@2.9.1)
+
+  extensions/volume-pricing-theme-block: {}
 
 packages:
 

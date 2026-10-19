@@ -1,0 +1,64 @@
+.original-price-strikethrough {
+  text-decoration: line-through;
+  color: #6d7175;
+  margin-right: 6px;
+}
+
+.tiered-discounted-price {
+  color: #008060;
+  font-weight: 700;
+}
+
+.volume-pricing-badge--active {
+  background-color: #e6f4ea;
+  color: #008060;
+  font-weight: 700;
+}
+
+/* Stacked discounted/strikethrough price (e.g. the cart subtotal value) —
+   discounted on top, smaller strikethrough directly below, right-aligned
+   so it fits as a single flex item inside a label/value row instead of
+   pushing a third column into that row. */
+.volume-pricing-price-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  line-height: 1.3;
+}
+
+.volume-pricing-price-stack .tiered-discounted-price {
+  font-size: 1.05em;
+}
+
+.volume-pricing-price-stack .original-price-strikethrough {
+  font-size: 0.85em;
+  margin-right: 0;
+}
+
+/* A whole new label/value row, inserted as a sibling of the totals row
+   (not inside it), so it never competes for space in that row's layout. */
+.volume-pricing-savings-row {
+  display: flex;
+  width: 100%;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 0.5rem;
+}
+
+.volume-pricing-savings-row__label,
+.volume-pricing-savings-row__value {
+  color: #008060;
+  font-weight: 600;
+}
+
+/* Defensive reinforcement of Dawn's own .totals row, scoped to the cart
+   footer so it can't affect any other ".totals" usage elsewhere: keeps it
+   full-width with the label docked left and the price stack docked right,
+   matching volume-pricing-savings-row exactly. Values, not pixels, so it
+   still follows the page's own type scale. */
+.cart__blocks .totals {
+  display: flex;
+  width: 100%;
+  justify-content: space-between;
+  align-items: center;
+}

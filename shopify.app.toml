@@ -21,7 +21,15 @@ api_version = "2026-10"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_metaobject_definitions,write_metaobjects,write_products,read_locations,write_inventory,read_inventory,read_publications,write_publications"
+scopes = "write_metaobject_definitions,write_metaobjects,write_products,read_locations,write_inventory,read_inventory,read_publications,write_publications,write_discounts,read_discounts,write_app_proxy"
+
+# Lets the storefront script call our backend (to issue/invalidate the
+# dynamic single-use volume-pricing discount code) via a Shopify-signed
+# request instead of exposing an unauthenticated public endpoint.
+[app_proxy]
+url = "https://trends-api-mu.vercel.app/apps/proxy"
+prefix = "apps"
+subpath = "volume-discount"
 
 [auth]
 redirect_urls = [

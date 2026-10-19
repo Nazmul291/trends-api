@@ -1,0 +1,49 @@
+{%- liquid
+  assign has_emitted_any = false
+-%}
+{%- capture cart_items_json -%}
+  {%- for item in cart.items -%}
+    {%- assign item_tiers = item.product.metafields.custom.volume_pricing.value -%}
+    {%- if item_tiers and item_tiers.size > 0 -%}
+      {%- if has_emitted_any -%},{%- endif -%}
+      {"key":{{ item.key | json }},"productId":{{ item.product.id | json }},"productHandle":{{ item.product.handle | json }},"variantId":{{ item.variant_id | json }},"quantity":{{ item.quantity | json }},"basePrice":{{ item.variant.price | divided_by: 100.00 }},"tiers":{{ item_tiers | json }}}
+      {%- assign has_emitted_any = true -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endcapture -%}
+
+{%- comment -%}
+  Global, site-wide data source for assets/volume-pricing-global.js. App embed
+  blocks only have access to the page's Global Liquid scope (no dynamic/section
+  sources), but `cart` IS part of that global scope on every page — including
+  the cart page and cart drawer — so looping cart.items here is what makes
+  tier pricing possible outside the product page, where the per-product
+  volume_pricing_table block isn't present to supply its own data.
+
+  Known limitation: this snapshot is rendered once per full page load. A
+  product added to the cart via AJAX (no page reload) won't have tier data
+  until the next full navigation/reload.
+
+  No cart token is emitted here: `cart.token` is not a documented Liquid
+  property (it only exists on the AJAX /cart.js JSON response) and always
+  renders nil/null. volume-pricing-global.js resolves the real token itself
+  via a /cart.js fetch on boot instead.
+{%- endcomment -%}
+<script type="application/json" id="volume-pricing-cart-data">
+  {
+    "currencySymbol": {{ cart.currency.symbol | json }},
+    "proxyPath": "/apps/volume-discount/sync",
+    "cartItems": [{{ cart_items_json }}]
+  }
+</script>
+
+<link rel="stylesheet" href="{{ 'volume-pricing-global.css' | asset_url }}">
+<script src="{{ 'volume-pricing-global.js' | asset_url }}" defer></script>
+
+{% schema %}
+{
+  "name": "Volume Pricing Engine",
+  "target": "head",
+  "settings": []
+}
+{% endschema %}

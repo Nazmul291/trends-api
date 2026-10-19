@@ -16,9 +16,20 @@ import {
   processSyncChunk,
   resetSyncCursor,
 } from "../../server/services/chunk-sync.service";
+import { activateVolumePricingDiscount } from "../../server/services/discount-activation.service";
 import { buildCronExpression } from "../../shared/utils/cron";
 import type { Region } from "../../shared/types/trends.types";
 import { ALL_REGIONS } from "../../shared/types/trends.types";
+
+// ---------------------------------------------------------------------------
+// Registering the tiered-discount-function as a live automatic discount
+// (discountAutomaticAppCreate) only works on Shopify Plus — standard-plan
+// merchants rely on the dynamic single-use discount code engine instead
+// (server/services/dynamic-discount.service.ts), so this card stays hidden
+// to avoid confusing them with a Plus-only action. Flip to true to show it
+// again for a Plus store.
+// ---------------------------------------------------------------------------
+const SHOW_PLUS_DISCOUNT_ACTIVATION_CARD = false;
 
 // ---------------------------------------------------------------------------
 // Region display metadata
@@ -248,11 +259,35 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 // ---------------------------------------------------------------------------
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
+  const { session, admin } = await authenticate.admin(request);
   const shop = session.shop;
 
   const formData = await request.formData();
   const actionType = formData.get("actionType");
+
+  // 1a0. Activate the deployed volume-pricing Shopify Function as a live
+  // automatic discount. Deploying a Function only uploads its Wasm binary —
+  // it does nothing at checkout until a discount record references it.
+  if (actionType === "activateVolumeDiscount") {
+    try {
+      const result = await activateVolumePricingDiscount(admin);
+      return {
+        success: result.success,
+        actionType: "activateVolumeDiscount",
+        message: result.message,
+        status: result.status,
+        error: result.success ? null : result.message,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        actionType: "activateVolumeDiscount",
+        message: null,
+        status: "error",
+        error: err instanceof Error ? err.message : "Failed to activate volume pricing discount.",
+      };
+    }
+  }
 
   // 1a. Run Single Sync Chunk Immediately (Safe Vercel Serverless Batch)
   if (actionType === "runSyncChunk") {
@@ -581,6 +616,10 @@ export default function SettingsPage() {
   const hasChunkError = actionData?.success === false && actionData?.actionType === "runSyncChunk";
   const hasResetSuccess = actionData?.success === true && actionData?.actionType === "resetSyncCursor";
   const hasResetError = actionData?.success === false && actionData?.actionType === "resetSyncCursor";
+  const hasActivateDiscountSuccess =
+    actionData?.success === true && actionData?.actionType === "activateVolumeDiscount";
+  const hasActivateDiscountError =
+    actionData?.success === false && actionData?.actionType === "activateVolumeDiscount";
 
   // Re-synchronize baseline immediately upon successful save action
   useEffect(() => {
@@ -2568,6 +2607,117 @@ export default function SettingsPage() {
           </div>
         )}
       </section>
+
+      {/* ----------------------------------------------------------------- */}
+      {/* SECTION 6: Volume Pricing Discount Activation (Shopify Plus only) */}
+      {/* ----------------------------------------------------------------- */}
+      {SHOW_PLUS_DISCOUNT_ACTIVATION_CARD && (
+        <section
+          style={{
+            backgroundColor: "#ffffff",
+            border: "1px solid #e1e3e5",
+            borderRadius: "12px",
+            padding: "24px",
+            boxShadow: "0 1px 3px rgba(0,0,0,0.03)",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "flex-start",
+              flexWrap: "wrap",
+              gap: "12px",
+              marginBottom: "16px",
+            }}
+          >
+            <div>
+              <h2
+                style={{
+                  margin: "0 0 6px 0",
+                  fontSize: "16px",
+                  fontWeight: 700,
+                  color: "#202223",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px",
+                }}
+              >
+                <span>🏷️</span> Volume Pricing Discount
+              </h2>
+              <p style={{ margin: 0, fontSize: "13px", color: "#6d7175" }}>
+                Deploying the tiered-discount-function (via <code>npm run deploy</code>) only uploads its
+                code — it applies no discounts at checkout until it&apos;s registered here as a live automatic
+                discount. Safe to click more than once; it does nothing if already active.
+              </p>
+            </div>
+
+            <Form method="post">
+              <input type="hidden" name="actionType" value="activateVolumeDiscount" />
+              <button
+                type="submit"
+                disabled={isSubmitting}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  padding: "8px 16px",
+                  fontSize: "13px",
+                  fontWeight: 600,
+                  color: isSubmitting ? "#6d7175" : "#008060",
+                  backgroundColor: isSubmitting ? "#f1f2f3" : "#e6f4ea",
+                  border: "1px solid #a3d9c9",
+                  borderRadius: "8px",
+                  cursor: isSubmitting ? "not-allowed" : "pointer",
+                  transition: "all 0.15s ease",
+                }}
+              >
+                <span>{isSubmitting ? "⏳" : "🏷️"}</span>
+                {isSubmitting ? "Activating…" : "Activate Volume Pricing Discount"}
+              </button>
+            </Form>
+          </div>
+
+          {hasActivateDiscountSuccess && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "10px",
+                padding: "10px 14px",
+                backgroundColor: "#f0fdf4",
+                border: "1px solid #bbf7d0",
+                borderRadius: "8px",
+                color: "#166534",
+                fontSize: "13px",
+                fontWeight: 600,
+              }}
+            >
+              <span style={{ fontSize: "18px" }}>✅</span>
+              {actionData?.message}
+            </div>
+          )}
+          {hasActivateDiscountError && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "10px",
+                padding: "10px 14px",
+                backgroundColor: "#fef2f2",
+                border: "1px solid #fecaca",
+                borderRadius: "8px",
+                color: "#991b1b",
+                fontSize: "13px",
+                fontWeight: 600,
+              }}
+            >
+              <span style={{ fontSize: "18px" }}>❌</span>
+              {actionData?.error || "Failed to activate the volume pricing discount."}
+            </div>
+          )}
+        </section>
+      )}
 
       {/* Info Card */}
       <div

@@ -1,0 +1,80 @@
+{% liquid
+  assign tiers = product.metafields.custom.volume_pricing.value
+  assign has_tiers = false
+  if tiers and tiers.size > 0
+    assign has_tiers = true
+  endif
+%}
+
+{% if has_tiers %}
+  <div
+    class="volume-pricing-table"
+    data-volume-pricing-block
+    data-product-id="{{ product.id }}"
+    style="--volume-pricing-highlight: {{ block.settings.highlight_color }}"
+    {{ block.shopify_attributes }}
+  >
+    <h3 class="volume-pricing-table__title">
+      {{ block.settings.title | default: 'default_title' | t }}
+    </h3>
+
+    <table class="volume-pricing-table__table">
+      <thead>
+        <tr>
+          <th>{{ 'quantity' | t }}</th>
+          <th>{{ 'unit_price' | t }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for tier in tiers %}
+          <tr
+            class="volume-pricing-table__row"
+            data-min-qty="{{ tier.minQuantity }}"
+            data-tier-price="{{ tier.price }}"
+          >
+            <td class="volume-pricing-table__qty">{{ tier.minQuantity }}+</td>
+            <td class="volume-pricing-table__price">{{ tier.price | times: 100 | money }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    {%- comment -%}
+      Read by assets/volume-pricing-global.js (loaded globally via the
+      volume_pricing_embed app embed) — not by any script local to this
+      block, so the dynamic pricing logic only has to live in one place.
+    {%- endcomment -%}
+    <script type="application/json" id="volume-pricing-product-data">
+      {
+        "basePrice": {{ product.selected_or_first_available_variant.price | divided_by: 100.00 | json }},
+        "currencySymbol": {{ cart.currency.symbol | json }},
+        "tiers": {{ tiers | json }}
+      }
+    </script>
+  </div>
+{% endif %}
+
+{% schema %}
+{
+  "name": "Volume Pricing Table",
+  "target": "section",
+  "enabled_on": {
+    "templates": ["product"]
+  },
+  "stylesheet": "volume-pricing.css",
+  "settings": [
+    {
+      "type": "text",
+      "id": "title",
+      "label": "t:settings.title.label",
+      "default": "Volume Pricing"
+    },
+    {
+      "type": "color",
+      "id": "highlight_color",
+      "label": "t:settings.highlight_color.label",
+      "default": "#e6f4ea"
+    }
+  ]
+}
+{% endschema %}

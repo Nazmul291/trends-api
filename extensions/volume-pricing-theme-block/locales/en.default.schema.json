@@ -1,0 +1,11 @@
+{
+  "name": "Volume Pricing Table",
+  "settings": {
+    "title": {
+      "label": "Table title"
+    },
+    "highlight_color": {
+      "label": "Active tier highlight color"
+    }
+  }
+}

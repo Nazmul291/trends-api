@@ -1,6 +1,8 @@
 packages:
   - 'extensions/*'
 shamefullyHoist: true
+overrides:
+  qs: '^6.16.0'
 allowBuilds:
   '@parcel/watcher': true
   '@prisma/client': true

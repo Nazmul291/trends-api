@@ -1,0 +1,45 @@
+.volume-pricing-table {
+  border: 1px solid #e1e3e5;
+  border-radius: 12px;
+  padding: 16px 18px;
+  margin: 16px 0;
+  background: #ffffff;
+}
+
+.volume-pricing-table__title {
+  margin: 0 0 10px 0;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.volume-pricing-table__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.volume-pricing-table__table th {
+  text-align: left;
+  font-weight: 600;
+  padding: 6px 8px;
+  border-bottom: 1px solid #e1e3e5;
+  color: #6d7175;
+}
+
+.volume-pricing-table__table td {
+  padding: 8px;
+  border-bottom: 1px solid #f1f2f3;
+}
+
+.volume-pricing-table__row {
+  transition: background-color 0.15s ease, font-weight 0.15s ease;
+}
+
+.volume-pricing-table__row--active {
+  background-color: var(--volume-pricing-highlight, #e6f4ea);
+  font-weight: 700;
+}
+
+.volume-pricing-table__row:last-child td {
+  border-bottom: none;
+}
