@@ -36,6 +36,10 @@ export interface AppSettingsData {
   inventorySyncMode: "single" | "split_equal";
   targetLocationId: string | null;
   splitLocationIds: string[];
+  // Pricing & Margin Defaults
+  defaultMarkupPercent: number;
+  defaultIncludeSetupInUnitCost: boolean;
+  defaultShippingBufferPerUnit: number;
   // Stateful Chunk Cursor for Vercel Cron
   currentSyncPage: number;
   totalCatalogPages: number;
@@ -123,6 +127,9 @@ function getEnvFallback(): AppSettingsData {
     inventorySyncMode: "single",
     targetLocationId: null,
     splitLocationIds: [],
+    defaultMarkupPercent: 35,
+    defaultIncludeSetupInUnitCost: true,
+    defaultShippingBufferPerUnit: 0.15,
     currentSyncPage: 1,
     totalCatalogPages: 1,
     syncCursorStatus: "idle",
@@ -162,6 +169,9 @@ export async function getAppSettings(shop: string): Promise<AppSettingsData> {
         inventorySyncMode: normalizeInventorySyncMode(record.inventorySyncMode),
         targetLocationId: record.targetLocationId || null,
         splitLocationIds: Array.isArray(record.splitLocationIds) ? record.splitLocationIds : [],
+        defaultMarkupPercent: record.defaultMarkupPercent ?? 35,
+        defaultIncludeSetupInUnitCost: record.defaultIncludeSetupInUnitCost ?? true,
+        defaultShippingBufferPerUnit: record.defaultShippingBufferPerUnit ?? 0.15,
         currentSyncPage: record.currentSyncPage ?? 1,
         totalCatalogPages: record.totalCatalogPages ?? 1,
         syncCursorStatus: record.syncCursorStatus || "idle",
@@ -218,6 +228,10 @@ export async function saveAppSettings(
       inventorySyncMode: rawMode !== undefined ? normalizeInventorySyncMode(rawMode) : "single",
       targetLocationId: rawTargetLoc !== undefined ? rawTargetLoc : null,
       splitLocationIds: Array.isArray(rawSplitLocs) ? rawSplitLocs : [],
+      defaultMarkupPercent: settings.defaultMarkupPercent !== undefined ? Number(settings.defaultMarkupPercent) : 35,
+      defaultIncludeSetupInUnitCost: settings.defaultIncludeSetupInUnitCost ?? true,
+      defaultShippingBufferPerUnit:
+        settings.defaultShippingBufferPerUnit !== undefined ? Number(settings.defaultShippingBufferPerUnit) : 0.15,
       currentSyncPage: settings.currentSyncPage !== undefined ? Number(settings.currentSyncPage) : 1,
       totalCatalogPages: settings.totalCatalogPages !== undefined ? Number(settings.totalCatalogPages) : 1,
       syncCursorStatus: settings.syncCursorStatus || "idle",
@@ -240,6 +254,15 @@ export async function saveAppSettings(
       ...(rawMode !== undefined && { inventorySyncMode: normalizeInventorySyncMode(rawMode) }),
       ...(rawTargetLoc !== undefined && { targetLocationId: rawTargetLoc }),
       ...(rawSplitLocs !== undefined && { splitLocationIds: Array.isArray(rawSplitLocs) ? rawSplitLocs : [] }),
+      ...(settings.defaultMarkupPercent !== undefined && {
+        defaultMarkupPercent: Number(settings.defaultMarkupPercent),
+      }),
+      ...(settings.defaultIncludeSetupInUnitCost !== undefined && {
+        defaultIncludeSetupInUnitCost: settings.defaultIncludeSetupInUnitCost,
+      }),
+      ...(settings.defaultShippingBufferPerUnit !== undefined && {
+        defaultShippingBufferPerUnit: Number(settings.defaultShippingBufferPerUnit),
+      }),
       ...(settings.currentSyncPage !== undefined && { currentSyncPage: Number(settings.currentSyncPage) }),
       ...(settings.totalCatalogPages !== undefined && { totalCatalogPages: Number(settings.totalCatalogPages) }),
       ...(settings.syncCursorStatus !== undefined && { syncCursorStatus: settings.syncCursorStatus }),
@@ -262,6 +285,9 @@ export async function saveAppSettings(
     inventorySyncMode: normalizeInventorySyncMode(record.inventorySyncMode),
     targetLocationId: record.targetLocationId || null,
     splitLocationIds: Array.isArray(record.splitLocationIds) ? record.splitLocationIds : [],
+    defaultMarkupPercent: record.defaultMarkupPercent ?? 35,
+    defaultIncludeSetupInUnitCost: record.defaultIncludeSetupInUnitCost ?? true,
+    defaultShippingBufferPerUnit: record.defaultShippingBufferPerUnit ?? 0.15,
     currentSyncPage: record.currentSyncPage ?? 1,
     totalCatalogPages: record.totalCatalogPages ?? 1,
     syncCursorStatus: record.syncCursorStatus || "idle",

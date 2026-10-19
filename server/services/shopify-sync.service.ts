@@ -5,6 +5,11 @@ import { normalizePricing } from "../../shared/types/trends.types";
 import { TrendsApiClient } from "../api-client/trends-client";
 import { getAppSettings } from "../settings/app-settings.service";
 import prisma from "../../app/db.server";
+import {
+  computeTierPricingFromTier,
+  findDefaultAdditionalCost,
+  type ResolvedPricingConfig,
+} from "../../shared/utils/pricing-engine";
 
 export type SyncStage =
   | "QUEUED"
@@ -130,7 +135,7 @@ function buildDescriptionHtml(product: ProductData): string {
 /**
  * Extracts base wholesale price formatted to 2 decimal places in regional currency.
  */
-export function extractBasePrice(product: ProductData, region: Region): string {
+export function extractBasePrice(product: ProductData, region: Region, pricingConfig: ResolvedPricingConfig): string {
   const pricingList = normalizePricing(product.pricing);
   if (pricingList.length > 0) {
     for (const group of pricingList) {
@@ -140,7 +145,15 @@ export function extractBasePrice(product: ProductData, region: Region): string {
           if (raw !== undefined && raw !== null && raw !== "") {
             const parsed = typeof raw === "number" ? raw : parseFloat(String(raw));
             if (!isNaN(parsed) && parsed > 0) {
-              return parsed.toFixed(2);
+              // Markup is applied to the full cumulative unit cost (base +
+              // print + amortized setup + shipping buffer), never to the raw
+              // tier price alone — see shared/utils/pricing-engine.ts.
+              const { finalSellingPrice } = computeTierPricingFromTier(
+                { quantity: p.quantity, price: parsed },
+                group.additional_costs,
+                pricingConfig
+              );
+              return finalSellingPrice.toFixed(2);
             }
           }
         }
@@ -169,16 +182,28 @@ export interface VolumePricingTier {
  * for this product this sync — never hardcoded — so re-syncing always refreshes
  * tiers to the supplier's current pricing.
  */
-export function buildVolumePricingTiers(product: ProductData): VolumePricingTier[] {
+export function buildVolumePricingTiers(
+  product: ProductData,
+  pricingConfig: ResolvedPricingConfig
+): VolumePricingTier[] {
   const tiers: VolumePricingTier[] = [];
 
   for (const group of normalizePricing(product.pricing)) {
     for (const p of group.prices || []) {
       const minQuantity = typeof p.quantity === "number" ? p.quantity : parseFloat(String(p.quantity));
-      const price = typeof p.price === "number" ? p.price : parseFloat(String(p.price));
+      const rawPrice = typeof p.price === "number" ? p.price : parseFloat(String(p.price));
 
-      if (Number.isFinite(minQuantity) && minQuantity > 0 && Number.isFinite(price) && price >= 0) {
-        tiers.push({ minQuantity, price });
+      if (Number.isFinite(minQuantity) && minQuantity > 0 && Number.isFinite(rawPrice) && rawPrice >= 0) {
+        // Every tier runs through the SAME markup calculation as the base
+        // price (extractBasePrice) — otherwise a large-quantity tier could
+        // end up priced at or below raw cost, letting the tiered-discount
+        // engine sell below what the product actually costs.
+        const { finalSellingPrice } = computeTierPricingFromTier(
+          { quantity: minQuantity, price: rawPrice },
+          group.additional_costs,
+          pricingConfig
+        );
+        tiers.push({ minQuantity, price: finalSellingPrice });
       }
     }
   }
@@ -1841,6 +1866,25 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
       ? existingSync.splitLocationIds
       : appSettings.splitLocationIds || [];
 
+  // Resolve effective pricing/margin config the same way: per-product
+  // override (existingSync) falls back to the shop-wide AppSettings default.
+  // `??` (not `||`) because includeSetupInUnitCost is a boolean — a stored
+  // `false` override must not be treated as "unset."
+  //
+  // selectedAdditionalCostId defaults to a "Screen Print" match (the Trends
+  // portal's own default branding) when the product has never had one
+  // explicitly chosen — not to "None"/unbranded.
+  const primaryGroupAdditionalCosts = normalizePricing(trendsProduct.pricing)[0]?.additional_costs;
+  const defaultAdditionalCostId = findDefaultAdditionalCost(primaryGroupAdditionalCosts)?.id;
+  const pricingConfig: ResolvedPricingConfig = {
+    defaultMarkupPercent: appSettings.defaultMarkupPercent,
+    tierMarkups: (existingSync?.tierMarkups as Record<string, number> | null) ?? null,
+    includeSetupInUnitCost: existingSync?.includeSetupInUnitCost ?? appSettings.defaultIncludeSetupInUnitCost,
+    shippingBufferPerUnit: existingSync?.shippingBufferOverride ?? appSettings.defaultShippingBufferPerUnit,
+    selectedAdditionalCostId:
+      existingSync?.selectedAdditionalCostId ?? (defaultAdditionalCostId ? Number(defaultAdditionalCostId) : null),
+  };
+
   // 2. Ensure product has live stock data from Trends API stock endpoint (/api/v1/stock/{id}.json)
   if (trendsCode) {
     try {
@@ -1881,7 +1925,7 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
   }
 
   // 3. Extract base price & variant specifications with isolated per-variant fault handling
-  const primaryPrice = extractBasePrice(trendsProduct, normalizedRegion);
+  const primaryPrice = extractBasePrice(trendsProduct, normalizedRegion, pricingConfig);
   const { optionName, specs: rawSpecs } = buildVariantSpecs(trendsProduct, normalizedRegion, trendsCode);
   console.info(
     `[Shopify Sync Diagnostic] trends code ${trendsCode}: trendsProduct.stock has ` +
@@ -2050,7 +2094,7 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
         namespace: "custom",
         key: "volume_pricing",
         type: "json",
-        value: JSON.stringify(buildVolumePricingTiers(trendsProduct)),
+        value: JSON.stringify(buildVolumePricingTiers(trendsProduct, pricingConfig)),
       },
       {
         namespace: "trends",

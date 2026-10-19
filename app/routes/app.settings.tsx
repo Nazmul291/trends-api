@@ -239,6 +239,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         : locations.length >= 2
         ? locations.slice(0, 2).map((l) => l.id)
         : [],
+    defaultMarkupPercent: settings.defaultMarkupPercent ?? 35,
+    defaultIncludeSetupInUnitCost: settings.defaultIncludeSetupInUnitCost ?? true,
+    defaultShippingBufferPerUnit: settings.defaultShippingBufferPerUnit ?? 0.15,
     locations,
     lastSyncedAt: settings.lastSyncedAt ? new Date(settings.lastSyncedAt).toISOString() : null,
     syncStatus: settings.syncStatus,
@@ -410,6 +413,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     };
   }
 
+  // Pricing & Margin Defaults
+  const defaultMarkupPercent = Math.max(0, Number(formData.get("defaultMarkupPercent")) || 0);
+  const defaultIncludeSetupInUnitCost = formData.get("defaultIncludeSetupInUnitCost") === "true";
+  const defaultShippingBufferPerUnit = Math.max(0, Number(formData.get("defaultShippingBufferPerUnit")) || 0);
+
   try {
     const saved = await saveAppSettings(shop, {
       trendsApiKey,
@@ -423,6 +431,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       inventorySyncMode,
       targetLocationId,
       splitLocationIds,
+      defaultMarkupPercent,
+      defaultIncludeSetupInUnitCost,
+      defaultShippingBufferPerUnit,
     });
 
     // Dynamically reschedule background runner
@@ -461,6 +472,9 @@ export default function SettingsPage() {
     inventorySyncMode: initialInventoryMode,
     targetLocationId: initialTargetLocation,
     splitLocationIds: initialSplitLocations,
+    defaultMarkupPercent: initialDefaultMarkupPercent,
+    defaultIncludeSetupInUnitCost: initialDefaultIncludeSetup,
+    defaultShippingBufferPerUnit: initialDefaultShippingBuffer,
     locations = [],
     lastSyncedAt,
     syncStatus,
@@ -496,6 +510,11 @@ export default function SettingsPage() {
   );
   const [targetLocation, setTargetLocation] = useState<string>(initialTargetLocation || "");
   const [splitLocations, setSplitLocations] = useState<string[]>(initialSplitLocations || []);
+
+  // Pricing & Margin Defaults state
+  const [defaultMarkupPercent, setDefaultMarkupPercent] = useState<number>(initialDefaultMarkupPercent ?? 35);
+  const [defaultIncludeSetup, setDefaultIncludeSetup] = useState<boolean>(initialDefaultIncludeSetup ?? true);
+  const [defaultShippingBuffer, setDefaultShippingBuffer] = useState<number>(initialDefaultShippingBuffer ?? 0.15);
 
   // Browser-driven "Sync All" state. Separate from the automated cron chunker
   // above: this walks the full catalog one product at a time from the browser,
@@ -576,6 +595,9 @@ export default function SettingsPage() {
     inventoryMode: initialInventoryMode || "single",
     targetLocation: initialTargetLocation || "",
     splitLocations: [...(initialSplitLocations || [])].sort(),
+    defaultMarkupPercent: initialDefaultMarkupPercent ?? 35,
+    defaultIncludeSetup: initialDefaultIncludeSetup ?? true,
+    defaultShippingBuffer: initialDefaultShippingBuffer ?? 0.15,
   }));
 
   // Re-synchronize baseline whenever fresh loader data is loaded
@@ -593,6 +615,9 @@ export default function SettingsPage() {
       inventoryMode: initialInventoryMode || "single",
       targetLocation: initialTargetLocation || "",
       splitLocations: [...(initialSplitLocations || [])].sort(),
+      defaultMarkupPercent: initialDefaultMarkupPercent ?? 35,
+      defaultIncludeSetup: initialDefaultIncludeSetup ?? true,
+      defaultShippingBuffer: initialDefaultShippingBuffer ?? 0.15,
     });
   }, [
     trendsApiKey,
@@ -606,6 +631,9 @@ export default function SettingsPage() {
     initialInventoryMode,
     initialTargetLocation,
     initialSplitLocations,
+    initialDefaultMarkupPercent,
+    initialDefaultIncludeSetup,
+    initialDefaultShippingBuffer,
   ]);
 
   const hasSaved = actionData?.success === true && actionData?.actionType === "saveSettings";
@@ -637,6 +665,9 @@ export default function SettingsPage() {
         inventoryMode,
         targetLocation,
         splitLocations: [...splitLocations].sort(),
+        defaultMarkupPercent,
+        defaultIncludeSetup,
+        defaultShippingBuffer,
       });
     }
   }, [hasSaved]);
@@ -653,6 +684,9 @@ export default function SettingsPage() {
     if (scopePrice !== persistedState.scopePrice) return true;
     if (inventoryMode !== persistedState.inventoryMode) return true;
     if (targetLocation !== persistedState.targetLocation) return true;
+    if (defaultMarkupPercent !== persistedState.defaultMarkupPercent) return true;
+    if (defaultIncludeSetup !== persistedState.defaultIncludeSetup) return true;
+    if (defaultShippingBuffer !== persistedState.defaultShippingBuffer) return true;
 
     // Compare active regions list
     const currentSorted = [...activeRegions].sort();
@@ -682,6 +716,9 @@ export default function SettingsPage() {
     inventoryMode,
     targetLocation,
     splitLocations,
+    defaultMarkupPercent,
+    defaultIncludeSetup,
+    defaultShippingBuffer,
     persistedState,
   ]);
 
@@ -699,6 +736,9 @@ export default function SettingsPage() {
     setInventoryMode(persistedState.inventoryMode);
     setTargetLocation(persistedState.targetLocation);
     setSplitLocations([...persistedState.splitLocations]);
+    setDefaultMarkupPercent(persistedState.defaultMarkupPercent);
+    setDefaultIncludeSetup(persistedState.defaultIncludeSetup);
+    setDefaultShippingBuffer(persistedState.defaultShippingBuffer);
   };
 
   const toggleRegion = (region: Region) => {
@@ -2012,6 +2052,131 @@ export default function SettingsPage() {
             {splitLocations.map((id) => (
               <input key={id} type="hidden" name="splitLocationIds" value={id} />
             ))}
+          </section>
+
+          {/* ----------------------------------------------------------------- */}
+          {/* SECTION: Pricing & Margin Defaults                                 */}
+          {/* ----------------------------------------------------------------- */}
+          <section
+            style={{
+              borderTop: "1px solid #e1e3e5",
+              paddingTop: "24px",
+              marginBottom: "24px",
+            }}
+          >
+            <h2
+              style={{
+                margin: "0 0 6px 0",
+                fontSize: "15px",
+                fontWeight: 700,
+                color: "#202223",
+              }}
+            >
+              Pricing & Margin Defaults
+            </h2>
+            <p style={{ margin: "0 0 20px 0", fontSize: "13px", color: "#6d7175" }}>
+              Shop-wide defaults used whenever a product has no per-product pricing override set on its own
+              Product Details page. Markup is applied last, to the full cumulative unit cost (base + print +
+              setup allocation + shipping buffer) — never to the base tier price alone.
+            </p>
+
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+                gap: "16px",
+                marginBottom: "16px",
+              }}
+            >
+              <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                <label htmlFor="defaultMarkupPercent" style={{ fontSize: "13px", fontWeight: 600, color: "#202223" }}>
+                  Default Markup %
+                </label>
+                <input
+                  id="defaultMarkupPercent"
+                  name="defaultMarkupPercent"
+                  type="number"
+                  min={0}
+                  step={0.1}
+                  value={defaultMarkupPercent}
+                  onChange={(e) => setDefaultMarkupPercent(Math.max(0, Number(e.target.value) || 0))}
+                  style={{
+                    padding: "9px 12px",
+                    fontSize: "13px",
+                    color: "#202223",
+                    backgroundColor: "#fafbfb",
+                    border: "1px solid #babfc3",
+                    borderRadius: "8px",
+                    outline: "none",
+                    boxSizing: "border-box",
+                  }}
+                />
+              </div>
+
+              <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                <label
+                  htmlFor="defaultShippingBufferPerUnit"
+                  style={{ fontSize: "13px", fontWeight: 600, color: "#202223" }}
+                >
+                  Default Shipping Buffer ($ / unit)
+                </label>
+                <input
+                  id="defaultShippingBufferPerUnit"
+                  name="defaultShippingBufferPerUnit"
+                  type="number"
+                  min={0}
+                  step={0.01}
+                  value={defaultShippingBuffer}
+                  onChange={(e) => setDefaultShippingBuffer(Math.max(0, Number(e.target.value) || 0))}
+                  style={{
+                    padding: "9px 12px",
+                    fontSize: "13px",
+                    color: "#202223",
+                    backgroundColor: "#fafbfb",
+                    border: "1px solid #babfc3",
+                    borderRadius: "8px",
+                    outline: "none",
+                    boxSizing: "border-box",
+                  }}
+                />
+              </div>
+            </div>
+
+            <label
+              style={{
+                display: "flex",
+                alignItems: "flex-start",
+                gap: "10px",
+                padding: "12px 14px",
+                backgroundColor: defaultIncludeSetup ? "#f3fdf7" : "#fafbfb",
+                border: `1px solid ${defaultIncludeSetup ? "#c2e5d9" : "#e1e3e5"}`,
+                borderRadius: "8px",
+                cursor: "pointer",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={defaultIncludeSetup}
+                onChange={(e) => setDefaultIncludeSetup(e.target.checked)}
+                style={{ accentColor: "#008060", marginTop: "2px", width: "16px", height: "16px" }}
+              />
+              <div>
+                <span style={{ fontSize: "13px", fontWeight: 600, color: "#202223" }}>
+                  Include Setup Price in Unit Cost by default
+                </span>
+                <p style={{ margin: "2px 0 0 0", fontSize: "12px", color: "#6d7175" }}>
+                  Amortizes each branding option&apos;s one-time setup fee across the tier quantity (setup fee ÷
+                  quantity) and folds it into the per-unit cost before markup. When off, the setup fee is left
+                  out of the per-unit calculation.
+                </p>
+              </div>
+            </label>
+
+            <input
+              type="hidden"
+              name="defaultIncludeSetupInUnitCost"
+              value={defaultIncludeSetup ? "true" : "false"}
+            />
           </section>
 
           {/* ----------------------------------------------------------------- */}

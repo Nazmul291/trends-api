@@ -44,6 +44,23 @@ model TrendProductSync {
   inventorySyncMode String?
   targetLocationId  String?
   splitLocationIds  String[]           @default([])
+
+  // Per-product Pricing & Margin Override — null means "use the shop-wide
+  // AppSettings default" (resolved in syncTrendProductToShopify via
+  // shared/utils/pricing-engine.ts's computeTierPricing()).
+  /// Per-quantity-tier markup % overrides, e.g. {"100": 35, "5000": 25} —
+  /// keyed by tier quantity as a string (JSON object keys are always
+  /// strings). A tier missing from this map falls back to
+  /// AppSettings.defaultMarkupPercent, not to any other tier's value.
+  tierMarkups              Json?
+  includeSetupInUnitCost   Boolean?
+  shippingBufferOverride   Float?
+  /// Which pricing.additional_costs[].id (from the Trends API) supplies this
+  /// product's print/setup cost — null means no branding option selected yet
+  /// (defaults to a Screen Print match if one exists; see
+  /// shared/utils/pricing-engine.ts's findDefaultAdditionalCost()).
+  selectedAdditionalCostId Int?
+
   lastSyncedAt     DateTime           @default(now())
   createdAt        DateTime           @default(now())
   updatedAt        DateTime           @updatedAt
@@ -113,6 +130,13 @@ model AppSettings {
   totalCatalogPages       Int      @default(1)
   syncCursorStatus        String   @default("idle")
   lastChunkProcessedAt    DateTime?
+
+  // Pricing & Margin Defaults — shop-wide fallback used by computeTierPricing()
+  // (shared/utils/pricing-engine.ts) whenever a product has no per-product
+  // override set on its TrendProductSync row.
+  defaultMarkupPercent          Float   @default(35)
+  defaultIncludeSetupInUnitCost Boolean @default(true)
+  defaultShippingBufferPerUnit  Float   @default(0.15)
 
   createdAt               DateTime @default(now())
   updatedAt               DateTime @updatedAt
