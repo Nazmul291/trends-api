@@ -15,17 +15,14 @@ import { StockBadge } from "../components/molecules/StockBadge";
 import { ThumbnailCarousel } from "../components/molecules/ThumbnailCarousel";
 import { LeadTimeIndicator } from "../components/molecules/LeadTimeIndicator";
 import { formatCurrency } from "../../shared/utils/formatters";
-import type { ProductData, StockItemData } from "../../shared/types/trends.types";
+import type { AdditionalCostData, ProductData, StockItemData } from "../../shared/types/trends.types";
 import { normalizePricing } from "../../shared/types/trends.types";
 import {
-  computeTierPricingFromTier,
-  resolveSelectedAdditionalCost,
-  findDefaultAdditionalCost,
+  computeTierSellPrice,
   filterOverriddenTierMarkups,
   normalizeSupplierTiers,
   resolveSupplierCostForQuantity,
   isValidTierQuantityList,
-  type AdditionalCostOption,
 } from "../../shared/utils/pricing-engine";
 
 /**
@@ -124,9 +121,6 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
         targetLocationId: true,
         splitLocationIds: true,
         tierMarkups: true,
-        includeSetupInUnitCost: true,
-        shippingBufferOverride: true,
-        selectedAdditionalCostId: true,
         isCustomTiers: true,
         customTierQuantities: true,
         lastSyncedAt: true,
@@ -168,8 +162,6 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       targetLocationId: settings.targetLocationId || primaryLocId,
       splitLocationIds: settings.splitLocationIds || [],
       defaultMarkupPercent: settings.defaultMarkupPercent ?? 35,
-      defaultIncludeSetupInUnitCost: settings.defaultIncludeSetupInUnitCost ?? true,
-      defaultShippingBufferPerUnit: settings.defaultShippingBufferPerUnit ?? 0.15,
     },
     productSync: productSync
       ? {
@@ -258,17 +250,6 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   if (intent === "savePricingOverride") {
     const appSettings = await getAppSettings(shop);
 
-    const postedIncludeSetup = formData.get("includeSetupInUnitCost") === "true";
-    const postedShippingBuffer = Math.max(0, Number(formData.get("shippingBufferOverride")) || 0);
-
-    // "0" is the deliberate "None / Unbranded" sentinel, distinct from "not
-    // overriding branding" (field omitted) — see pricing-engine.ts's
-    // resolveSelectedAdditionalCost. The client only posts this field when
-    // the selection differs from this product's own computed default branding
-    // option; there is no shop-wide AppSettings field to compare against here.
-    const rawSelectedId = formData.get("selectedAdditionalCostId");
-    const selectedAdditionalCostId = rawSelectedId !== null && rawSelectedId !== "" ? Number(rawSelectedId) : null;
-
     // Per-tier markup overrides, posted as one JSON blob (see
     // tierMarkupsJson in handleSavePricingOverride) rather than one form
     // field per tier, since the tier list varies per product.
@@ -316,17 +297,8 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     // actually differs from the current global default.
     const effectiveTierMarkups = filterOverriddenTierMarkups(postedTierMarkups, appSettings.defaultMarkupPercent);
     const tierMarkups = Object.keys(effectiveTierMarkups).length > 0 ? effectiveTierMarkups : null;
-    const includeSetupInUnitCost =
-      postedIncludeSetup === appSettings.defaultIncludeSetupInUnitCost ? null : postedIncludeSetup;
-    const shippingBufferOverride =
-      postedShippingBuffer === appSettings.defaultShippingBufferPerUnit ? null : postedShippingBuffer;
 
-    const hasOverride =
-      tierMarkups !== null ||
-      includeSetupInUnitCost !== null ||
-      shippingBufferOverride !== null ||
-      selectedAdditionalCostId !== null ||
-      isCustomTiers;
+    const hasOverride = tierMarkups !== null || isCustomTiers;
 
     try {
       const existing = await prisma.trendProductSync.findFirst({
@@ -343,9 +315,6 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
           where: { id: existing.id },
           data: {
             tierMarkups: tierMarkupsValue,
-            includeSetupInUnitCost,
-            shippingBufferOverride,
-            selectedAdditionalCostId,
             isCustomTiers,
             customTierQuantities,
           },
@@ -358,9 +327,6 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
             shopifyProductId: `pending-sync-${productId}`,
             region: "au",
             tierMarkups: tierMarkupsValue,
-            includeSetupInUnitCost,
-            shippingBufferOverride,
-            selectedAdditionalCostId,
             isCustomTiers,
             customTierQuantities,
           },
@@ -394,19 +360,9 @@ function makeTierRow(quantity: number | "", markupPercent: number): TierRow {
   return { key: tierRowKeySeq, quantity: String(quantity), markupPercent };
 }
 
-/** Comparable snapshot of the pricing draft — row keys excluded, quantities parsed. */
-function pricingDraftSignature(
-  rows: TierRow[],
-  includeSetup: boolean,
-  shippingBuffer: number,
-  selectedAdditionalCostId: number | null
-): string {
-  return JSON.stringify({
-    tiers: rows.map((r) => [r.quantity.trim() === "" ? null : Number(r.quantity), r.markupPercent]),
-    includeSetup,
-    shippingBuffer,
-    selectedAdditionalCostId,
-  });
+/** Comparable snapshot of the tier draft — row keys excluded, quantities parsed. */
+function pricingDraftSignature(rows: TierRow[]): string {
+  return JSON.stringify(rows.map((r) => [r.quantity.trim() === "" ? null : Number(r.quantity), r.markupPercent]));
 }
 
 export default function ProductDetailPage() {
@@ -420,8 +376,6 @@ export default function ProductDetailPage() {
     targetLocationId: "",
     splitLocationIds: [],
     defaultMarkupPercent: 35,
-    defaultIncludeSetupInUnitCost: true,
-    defaultShippingBufferPerUnit: 0.15,
   };
   const productSync = loaderData?.productSync;
   const shopifyProductUrl = loaderData?.shopifyProductUrl || null;
@@ -509,23 +463,19 @@ export default function ProductDetailPage() {
       : locations.slice(0, 2).map((l) => l.id)
   );
 
-  // additional_costs[] for the primary pricing group — the branding/setup
-  // options the "Branding Option" select below is built from. Declared via
-  // useMemo (not a plain const after an early return) so React's hook order
-  // stays stable across the "still loading"/"failed"/"loaded" early returns
-  // further down this component. Computed BEFORE the pricing-override state
-  // block below, since that state's initializer needs it (to default the
-  // branding selection to a Screen Print match).
-  const additionalCosts = useMemo<AdditionalCostOption[]>(() => {
-    const groups = normalizePricing(product?.pricing);
-    return (groups[0]?.additional_costs || []) as AdditionalCostOption[];
-  }, [product]);
+  // The supplier's branding options & extra costs (primary pricing group) —
+  // shown read-only for reference. They're sold as separate storefront cart
+  // lines, so they never feed into the sell price. Declared via useMemo (not
+  // a plain const after an early return) so React's hook order stays stable
+  // across the "still loading"/"failed"/"loaded" early returns further down.
+  const additionalCosts = useMemo<AdditionalCostData[]>(
+    () => normalizePricing(product?.pricing)[0]?.additional_costs || [],
+    [product]
+  );
 
   // Pricing & Margin override state — mirrors the inventory-override pattern
-  // above (per-product override, falling back to shop-wide defaults), with
-  // two differences: markup is a per-tier map (tierMarkups), not one scalar,
-  // and `selectedAdditionalCostId` distinguishes "never chosen" (null, falls
-  // back to a Screen Print default) from "explicitly chose None" (0).
+  // above (per-product override, falling back to shop-wide defaults), except
+  // markup is a per-tier map (tierMarkups), not one scalar.
   //
   // There is deliberately no manual "enable override" toggle: override status
   // is derived (see hasPricingOverride below) by diffing the draft values
@@ -533,28 +483,18 @@ export default function ProductDetailPage() {
   // server-side in the savePricingOverride action.
   const pricingFetcher = useFetcher<typeof action>();
   const defaultMarkupPercent = globalSettings.defaultMarkupPercent ?? 35;
-  const defaultIncludeSetup = globalSettings.defaultIncludeSetupInUnitCost ?? true;
-  const defaultShippingBuffer = globalSettings.defaultShippingBufferPerUnit ?? 0.15;
-  const defaultAdditionalCostId = useMemo(() => {
-    const match = findDefaultAdditionalCost(additionalCosts);
-    return match?.id != null ? Number(match.id) : null;
-  }, [additionalCosts]);
   const supplierTiers = useMemo(
     () => normalizeSupplierTiers(normalizePricing(product?.pricing)[0]?.prices),
     [product]
   );
 
   const [tierRows, setTierRows] = useState<TierRow[]>([]);
-  const [includeSetup, setIncludeSetup] = useState<boolean>(defaultIncludeSetup);
-  const [shippingBuffer, setShippingBuffer] = useState<number>(defaultShippingBuffer);
-  const [selectedAdditionalCostId, setSelectedAdditionalCostId] = useState<number | null>(null);
   // Signature of the last saved/loaded values; Save stays disabled while the draft matches it.
   const [savedPricingSignature, setSavedPricingSignature] = useState<string | null>(null);
 
   // Hydrate the drafts once BOTH the loader's productSync and the
   // client-fetched Trends product exist — the product loads asynchronously,
-  // so a useState initializer would run before supplier tiers and branding
-  // options are known. Re-runs when a save/resync revalidation hands back a
+  // so a useState initializer would run before supplier tiers are known. Re-runs when a save/resync revalidation hands back a
   // new productSync, or the page switches product.
   const hydratedForRef = React.useRef<{ sync: unknown; code: unknown }>({ sync: undefined, code: undefined });
   useEffect(() => {
@@ -568,25 +508,9 @@ export default function ProductDetailPage() {
         ? productSync.customTierQuantities
         : supplierTiers.map((t) => t.quantity);
     const rows = quantities.map((q) => makeTierRow(q, savedMarkups[String(q)] ?? defaultMarkupPercent));
-    const savedIncludeSetup = productSync?.includeSetupInUnitCost ?? defaultIncludeSetup;
-    const savedShippingBuffer = productSync?.shippingBufferOverride ?? defaultShippingBuffer;
-    const savedAdditionalCostId = productSync?.selectedAdditionalCostId ?? defaultAdditionalCostId;
     setTierRows(rows);
-    setIncludeSetup(savedIncludeSetup);
-    setShippingBuffer(savedShippingBuffer);
-    setSelectedAdditionalCostId(savedAdditionalCostId);
-    setSavedPricingSignature(
-      pricingDraftSignature(rows, savedIncludeSetup, savedShippingBuffer, savedAdditionalCostId)
-    );
-  }, [
-    product,
-    productSync,
-    supplierTiers,
-    defaultAdditionalCostId,
-    defaultMarkupPercent,
-    defaultIncludeSetup,
-    defaultShippingBuffer,
-  ]);
+    setSavedPricingSignature(pricingDraftSignature(rows));
+  }, [product, productSync, supplierTiers, defaultMarkupPercent]);
 
   // Derived from the rows: parsed quantities (NaN for a blank/invalid input),
   // and the quantity-keyed markup map the shared engine and the action expect.
@@ -601,7 +525,7 @@ export default function ProductDetailPage() {
 
   const hasUnsavedPricingChanges =
     savedPricingSignature !== null &&
-    pricingDraftSignature(tierRows, includeSetup, shippingBuffer, selectedAdditionalCostId) !== savedPricingSignature;
+    pricingDraftSignature(tierRows) !== savedPricingSignature;
 
   const tierError = isValidTierQuantityList(tierQuantities)
     ? null
@@ -614,49 +538,26 @@ export default function ProductDetailPage() {
   const isCustomTiersDraft =
     tierQuantities.length !== supplierTiers.length || tierQuantities.some((q, i) => q !== supplierTiers[i].quantity);
 
-  const selectedAdditionalCost = useMemo(
-    () => resolveSelectedAdditionalCost(additionalCosts, selectedAdditionalCostId),
-    [additionalCosts, selectedAdditionalCostId]
-  );
-  const printUnitCost = Number(selectedAdditionalCost?.unit_price) || 0;
-
   // Live per-tier recalculation — the exact same shared engine the Shopify
   // sync pipeline uses (server/services/shopify-sync.service.ts), so this
   // preview can never drift from what actually gets pushed on next sync.
   const computedTiers = useMemo(() => {
     if (supplierTiers.length === 0) return [];
-    const config = {
-      defaultMarkupPercent,
-      tierMarkups,
-      includeSetupInUnitCost: includeSetup,
-      shippingBufferPerUnit: shippingBuffer,
-      selectedAdditionalCostId,
-      customTierQuantities: null,
-    };
+    const config = { defaultMarkupPercent, tierMarkups, customTierQuantities: null };
     return tierRows.map((row, i) => {
       const quantity = tierQuantities[i];
       if (!Number.isInteger(quantity) || quantity <= 0) {
-        return { row, baseCost: null, belowMoq: false, pricing: null };
+        return { row, baseCost: null, belowMoq: false, sellPrice: null };
       }
       const baseCost = resolveSupplierCostForQuantity(supplierTiers, quantity);
       return {
         row,
         baseCost,
         belowMoq: quantity < supplierTiers[0].quantity,
-        pricing: computeTierPricingFromTier({ quantity, price: baseCost }, additionalCosts, config),
+        sellPrice: computeTierSellPrice({ quantity, price: baseCost }, config),
       };
     });
-  }, [
-    supplierTiers,
-    tierRows,
-    tierQuantities,
-    tierMarkups,
-    additionalCosts,
-    defaultMarkupPercent,
-    includeSetup,
-    shippingBuffer,
-    selectedAdditionalCostId,
-  ]);
+  }, [supplierTiers, tierRows, tierQuantities, tierMarkups, defaultMarkupPercent]);
 
   // Automatic Override Detection — no manual toggle; a product counts as
   // "custom" the instant any draft value actually differs from the current
@@ -668,18 +569,10 @@ export default function ProductDetailPage() {
     () => filterOverriddenTierMarkups(tierMarkups, defaultMarkupPercent),
     [tierMarkups, defaultMarkupPercent]
   );
-  const hasPricingOverride =
-    isCustomTiersDraft ||
-    Object.keys(effectiveTierMarkups).length > 0 ||
-    includeSetup !== defaultIncludeSetup ||
-    shippingBuffer !== defaultShippingBuffer ||
-    selectedAdditionalCostId !== defaultAdditionalCostId;
+  const hasPricingOverride = isCustomTiersDraft || Object.keys(effectiveTierMarkups).length > 0;
 
   const handleResetPricingToDefault = () => {
     setTierRows(supplierTiers.map((t) => makeTierRow(t.quantity, defaultMarkupPercent)));
-    setIncludeSetup(defaultIncludeSetup);
-    setShippingBuffer(defaultShippingBuffer);
-    setSelectedAdditionalCostId(defaultAdditionalCostId);
   };
 
   // Restores only the supplier's quantity breaks, keeping any markup already
@@ -743,20 +636,11 @@ export default function ProductDetailPage() {
   const handleSavePricingOverride = () => {
     const formData = new FormData();
     formData.append("intent", "savePricingOverride");
-    // Draft values are always sent — the action independently decides
-    // null-vs-value per field by comparing against the shop's AppSettings
-    // (and, for branding, against this product's own default match).
+    // Markups are always sent — the action independently decides
+    // null-vs-value by comparing against the shop's AppSettings default.
     formData.append("tierMarkupsJson", JSON.stringify(tierMarkups));
-    formData.append("includeSetupInUnitCost", includeSetup ? "true" : "false");
-    formData.append("shippingBufferOverride", String(shippingBuffer));
-    // Only sent when it differs from this product's own computed default
-    // branding option — there's no shop-wide AppSettings field for branding,
-    // so omitting it is how we signal "no override" for this one dimension.
-    if (selectedAdditionalCostId !== defaultAdditionalCostId) {
-      formData.append("selectedAdditionalCostId", String(selectedAdditionalCostId ?? ""));
-    }
-    // Same convention for tiers: only sent when they differ from the
-    // supplier's breaks, which only the client has loaded.
+    // Tier quantities are only sent when they differ from the supplier's
+    // breaks, which only the client has loaded.
     if (isCustomTiersDraft) {
       formData.append("customTierQuantitiesJson", JSON.stringify(tierQuantities));
     }
@@ -1312,109 +1196,38 @@ export default function ProductDetailPage() {
                 </div>
               </div>
 
-              {computedTiers[0]?.pricing && (
+              {computedTiers[0]?.sellPrice != null && (
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
                   <span style={{ fontSize: "11px", color: "#6d7175" }}>Selling price shown to customers</span>
                   <span style={{ fontSize: "22px", fontWeight: 700, color: "#008060" }}>
-                    {formatCurrency(computedTiers[0].pricing.finalSellingPrice, currentRegion)}
+                    {formatCurrency(computedTiers[0].sellPrice, currentRegion)}
                   </span>
                 </div>
               )}
-
-              {/* Controls — note there's deliberately no single global "Markup %"
-                  input here: markup is set per-tier in the table below, each
-                  independent (falling back to the shop-wide default only for
-                  a tier that's never been touched). */}
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: "10px" }}>
-                {additionalCosts.length > 0 && (
-                  <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                    <label htmlFor="selectedAdditionalCostId" style={{ fontSize: "11px", fontWeight: 600, color: "#202223" }}>
-                      Branding Option
-                    </label>
-                    <select
-                      id="selectedAdditionalCostId"
-                      value={selectedAdditionalCostId ?? 0}
-                      onChange={(e) => setSelectedAdditionalCostId(Number(e.target.value))}
-                      style={{
-                        padding: "7px 10px",
-                        fontSize: "12px",
-                        borderRadius: "6px",
-                        border: "1px solid #babfc3",
-                        backgroundColor: "#ffffff",
-                      }}
-                    >
-                      {/* "0" is the explicit None/Unbranded sentinel — never a
-                          real Trends additional_costs[].id — distinct from
-                          this field defaulting to a Screen Print match when
-                          the product has no selection stored at all. */}
-                      <option value={0}>None (Unbranded)</option>
-                      {additionalCosts.map((c) => (
-                        <option key={String(c.id)} value={String(c.id)}>
-                          {c.description || c.branding_option || `Option ${c.id}`}
-                          {Number(c.setup_price) > 0 ? ` ($${c.setup_price} setup)` : ""}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                )}
-
-                <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                  <label htmlFor="shippingBufferInput" style={{ fontSize: "11px", fontWeight: 600, color: "#202223" }}>
-                    Shipping Buffer ($/unit)
-                  </label>
-                  <input
-                    id="shippingBufferInput"
-                    type="number"
-                    min={0}
-                    step={0.01}
-                    value={shippingBuffer}
-                    onChange={(e) => setShippingBuffer(Math.max(0, Number(e.target.value) || 0))}
-                    style={{
-                      padding: "7px 10px",
-                      fontSize: "12px",
-                      borderRadius: "6px",
-                      border: "1px solid #babfc3",
-                      boxSizing: "border-box",
-                    }}
-                  />
-                </div>
-              </div>
-
-              <label style={{ display: "flex", alignItems: "center", gap: "8px", cursor: "pointer" }}>
-                <input
-                  type="checkbox"
-                  checked={includeSetup}
-                  onChange={(e) => setIncludeSetup(e.target.checked)}
-                  style={{ accentColor: "#008060", width: "14px", height: "14px" }}
-                />
-                <span style={{ fontSize: "12px", color: "#202223", fontWeight: 600 }}>
-                  Include Setup Price in Unit Cost
-                </span>
-              </label>
 
               {/* Per-tier table — quantity AND markup are editable per row,
                   and rows can be added/removed. Each row's base cost is the
                   supplier's applicable break (highest supplier quantity at or
                   below it), so custom tiers still track supplier price
                   changes; once quantities differ from the supplier's, they're
-                  saved as custom tiers that resyncs never overwrite. */}
+                  saved as custom tiers that resyncs never overwrite.
+                  Sell Price = Base Cost × (1 + Markup %) — branding is sold
+                  as separate storefront cart lines, never baked in here. */}
               {supplierTiers.length > 0 && (
                 <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
                   <div style={{ overflowX: "auto" }}>
-                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px", minWidth: "620px" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px", minWidth: "440px" }}>
                       <thead>
                         <tr style={{ color: "#6d7175" }}>
                           <th style={{ textAlign: "left", padding: "4px 6px", width: "100px" }}>Min Qty</th>
                           <th style={{ textAlign: "right", padding: "4px 6px" }}>Base Cost</th>
-                          <th style={{ textAlign: "right", padding: "4px 6px" }}>Print + Setup/Qty</th>
-                          <th style={{ textAlign: "right", padding: "4px 6px" }}>Unit Cost</th>
                           <th style={{ textAlign: "right", padding: "4px 6px", width: "90px" }}>Markup %</th>
                           <th style={{ textAlign: "right", padding: "4px 6px" }}>Sell Price</th>
                           <th style={{ width: "32px" }} aria-label="Remove tier" />
                         </tr>
                       </thead>
                       <tbody>
-                        {computedTiers.map(({ row, baseCost, belowMoq, pricing }) => (
+                        {computedTiers.map(({ row, baseCost, belowMoq, sellPrice }) => (
                           <tr key={row.key} style={{ borderTop: "1px solid #e1e3e5" }}>
                             <td style={{ textAlign: "left", padding: "4px 6px" }}>
                               <input
@@ -1430,7 +1243,7 @@ export default function ProductDetailPage() {
                                   fontSize: "12px",
                                   fontWeight: 600,
                                   borderRadius: "5px",
-                                  border: `1px solid ${pricing ? "#babfc3" : "#d82c0d"}`,
+                                  border: `1px solid ${sellPrice !== null ? "#babfc3" : "#d82c0d"}`,
                                   boxSizing: "border-box",
                                 }}
                               />
@@ -1445,14 +1258,6 @@ export default function ProductDetailPage() {
                                   below MOQ
                                 </div>
                               )}
-                            </td>
-                            <td style={{ textAlign: "right", padding: "6px", color: "#6d7175" }}>
-                              {pricing
-                                ? `${formatCurrency(printUnitCost, currentRegion)} + ${formatCurrency(pricing.setupAllocationPerUnit, currentRegion)}`
-                                : "—"}
-                            </td>
-                            <td style={{ textAlign: "right", padding: "6px" }}>
-                              {pricing ? formatCurrency(pricing.unitCost, currentRegion) : "—"}
                             </td>
                             <td style={{ textAlign: "right", padding: "4px 6px" }}>
                               <input
@@ -1476,7 +1281,7 @@ export default function ProductDetailPage() {
                               />
                             </td>
                             <td style={{ textAlign: "right", padding: "6px", fontWeight: 700, color: "#008060" }}>
-                              {pricing ? formatCurrency(pricing.finalSellingPrice, currentRegion) : "—"}
+                              {sellPrice !== null ? formatCurrency(sellPrice, currentRegion) : "—"}
                             </td>
                             <td style={{ textAlign: "center", padding: "4px" }}>
                               <button
@@ -1533,6 +1338,53 @@ export default function ProductDetailPage() {
                   </div>
 
                   {tierError && <div style={{ fontSize: "12px", color: "#b91c1c" }}>⚠️ {tierError}</div>}
+                </div>
+              )}
+
+              {additionalCosts.length > 0 && (
+                <div
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "6px",
+                    paddingTop: "12px",
+                    borderTop: "1px solid #e1e3e5",
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "8px" }}>
+                    <span style={{ fontSize: "12px", fontWeight: 700, color: "#202223" }}>
+                      Branding Options &amp; Extra Costs
+                    </span>
+                    <span style={{ fontSize: "11px", color: "#6d7175" }}>
+                      Supplier reference · read-only · not included in Sell Price
+                    </span>
+                  </div>
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px", minWidth: "440px" }}>
+                      <thead>
+                        <tr style={{ color: "#6d7175" }}>
+                          <th style={{ textAlign: "left", padding: "4px 6px" }}>Branding</th>
+                          <th style={{ textAlign: "left", padding: "4px 6px" }}>Charge</th>
+                          <th style={{ textAlign: "right", padding: "4px 6px" }}>Per Unit</th>
+                          <th style={{ textAlign: "right", padding: "4px 6px" }}>Setup</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {additionalCosts.map((cost, index) => (
+                          <tr key={cost.id ?? index} style={{ borderTop: "1px solid #e1e3e5", color: "#202223" }}>
+                            <td style={{ padding: "6px" }}>{cost.branding_option || "—"}</td>
+                            <td style={{ padding: "6px", color: "#6d7175" }}>{cost.description || "—"}</td>
+                            <td style={{ textAlign: "right", padding: "6px" }}>
+                              {formatCurrency(Number(cost.unit_price) || 0, currentRegion)}
+                            </td>
+                            <td style={{ textAlign: "right", padding: "6px" }}>
+                              {formatCurrency(Number(cost.setup_price) || 0, currentRegion)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
               )}
 

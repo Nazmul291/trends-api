@@ -7,8 +7,7 @@ import { getAppSettings } from "../settings/app-settings.service";
 import prisma from "../../app/db.server";
 import {
   buildEffectiveTiers,
-  computeTierPricingFromTier,
-  findDefaultAdditionalCost,
+  computeTierSellPrice,
   normalizeSupplierTiers,
   type ResolvedPricingConfig,
 } from "../../shared/utils/pricing-engine";
@@ -150,20 +149,16 @@ function resolveCustomTiers(product: ProductData, pricingConfig: ResolvedPricing
   const primary = normalizePricing(product.pricing)[0];
   const supplierTiers = normalizeSupplierTiers(primary?.prices);
   if (supplierTiers.length === 0) return null;
-  return {
-    tiers: buildEffectiveTiers(supplierTiers, pricingConfig.customTierQuantities),
-    additionalCosts: primary.additional_costs,
-  };
+  return buildEffectiveTiers(supplierTiers, pricingConfig.customTierQuantities);
 }
 
 /**
  * Extracts base wholesale price formatted to 2 decimal places in regional currency.
  */
 export function extractBasePrice(product: ProductData, region: Region, pricingConfig: ResolvedPricingConfig): string {
-  const custom = resolveCustomTiers(product, pricingConfig);
-  if (custom) {
-    const { finalSellingPrice } = computeTierPricingFromTier(custom.tiers[0], custom.additionalCosts, pricingConfig);
-    return finalSellingPrice.toFixed(2);
+  const customTiers = resolveCustomTiers(product, pricingConfig);
+  if (customTiers) {
+    return computeTierSellPrice(customTiers[0], pricingConfig).toFixed(2);
   }
 
   const pricingList = normalizePricing(product.pricing);
@@ -175,15 +170,9 @@ export function extractBasePrice(product: ProductData, region: Region, pricingCo
           if (raw !== undefined && raw !== null && raw !== "") {
             const parsed = typeof raw === "number" ? raw : parseFloat(String(raw));
             if (!isNaN(parsed) && parsed > 0) {
-              // Markup is applied to the full cumulative unit cost (base +
-              // print + amortized setup + shipping buffer), never to the raw
-              // tier price alone — see shared/utils/pricing-engine.ts.
-              const { finalSellingPrice } = computeTierPricingFromTier(
-                { quantity: p.quantity, price: parsed },
-                group.additional_costs,
-                pricingConfig
-              );
-              return finalSellingPrice.toFixed(2);
+              // Branding is sold as separate cart lines, never baked into
+              // this price — see shared/utils/pricing-engine.ts.
+              return computeTierSellPrice({ quantity: p.quantity, price: parsed }, pricingConfig).toFixed(2);
             }
           }
         }
@@ -216,11 +205,11 @@ export function buildVolumePricingTiers(
   product: ProductData,
   pricingConfig: ResolvedPricingConfig
 ): VolumePricingTier[] {
-  const custom = resolveCustomTiers(product, pricingConfig);
-  if (custom) {
-    return custom.tiers.map((tier) => ({
+  const customTiers = resolveCustomTiers(product, pricingConfig);
+  if (customTiers) {
+    return customTiers.map((tier) => ({
       minQuantity: tier.quantity,
-      price: computeTierPricingFromTier(tier, custom.additionalCosts, pricingConfig).finalSellingPrice,
+      price: computeTierSellPrice(tier, pricingConfig),
     }));
   }
 
@@ -236,12 +225,7 @@ export function buildVolumePricingTiers(
         // price (extractBasePrice) — otherwise a large-quantity tier could
         // end up priced at or below raw cost, letting the tiered-discount
         // engine sell below what the product actually costs.
-        const { finalSellingPrice } = computeTierPricingFromTier(
-          { quantity: minQuantity, price: rawPrice },
-          group.additional_costs,
-          pricingConfig
-        );
-        tiers.push({ minQuantity, price: finalSellingPrice });
+        tiers.push({ minQuantity, price: computeTierSellPrice({ quantity: minQuantity, price: rawPrice }, pricingConfig) });
       }
     }
   }
@@ -1906,21 +1890,9 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
 
   // Resolve effective pricing/margin config the same way: per-product
   // override (existingSync) falls back to the shop-wide AppSettings default.
-  // `??` (not `||`) because includeSetupInUnitCost is a boolean — a stored
-  // `false` override must not be treated as "unset."
-  //
-  // selectedAdditionalCostId defaults to a "Screen Print" match (the Trends
-  // portal's own default branding) when the product has never had one
-  // explicitly chosen — not to "None"/unbranded.
-  const primaryGroupAdditionalCosts = normalizePricing(trendsProduct.pricing)[0]?.additional_costs;
-  const defaultAdditionalCostId = findDefaultAdditionalCost(primaryGroupAdditionalCosts)?.id;
   const pricingConfig: ResolvedPricingConfig = {
     defaultMarkupPercent: appSettings.defaultMarkupPercent,
     tierMarkups: (existingSync?.tierMarkups as Record<string, number> | null) ?? null,
-    includeSetupInUnitCost: existingSync?.includeSetupInUnitCost ?? appSettings.defaultIncludeSetupInUnitCost,
-    shippingBufferPerUnit: existingSync?.shippingBufferOverride ?? appSettings.defaultShippingBufferPerUnit,
-    selectedAdditionalCostId:
-      existingSync?.selectedAdditionalCostId ?? (defaultAdditionalCostId ? Number(defaultAdditionalCostId) : null),
     customTierQuantities:
       existingSync?.isCustomTiers && existingSync.customTierQuantities.length > 0
         ? existingSync.customTierQuantities

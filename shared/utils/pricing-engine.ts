@@ -7,16 +7,10 @@
  * a merchant sees while typing a markup % is guaranteed to be the number
  * that eventually lands on the Shopify variant price / volume_pricing
  * metafield. Never duplicate this math elsewhere.
+ *
+ * Branding (print/setup) is deliberately NOT part of this price: it's sold as
+ * separate cart lines on the storefront, so baking it in would charge twice.
  */
-
-/** A single additional_costs[] entry from the Trends API product payload. */
-export interface AdditionalCostOption {
-  id?: number | string;
-  description?: string;
-  branding_option?: string;
-  unit_price?: number | string;
-  setup_price?: number | string;
-}
 
 /**
  * Per-quantity-tier markup % overrides, e.g. { "100": 35, "5000": 25 } —
@@ -32,9 +26,6 @@ export interface ResolvedPricingConfig {
   /** Shop-wide fallback used for any tier not present in tierMarkups. */
   defaultMarkupPercent: number;
   tierMarkups: TierMarkupMap | null;
-  includeSetupInUnitCost: boolean;
-  shippingBufferPerUnit: number;
-  selectedAdditionalCostId: number | null;
   /** Merchant-defined tier quantities replacing the supplier's breaks, or null to use the supplier's. */
   customTierQuantities: number[] | null;
 }
@@ -45,89 +36,23 @@ export function resolveMarkupPercentForTier(config: ResolvedPricingConfig, quant
   return typeof override === "number" && Number.isFinite(override) ? override : config.defaultMarkupPercent;
 }
 
-export interface PricingEngineInput {
-  baseTierPrice: number;
-  tierQuantity: number;
-  printUnitCost: number;
-  setupFee: number;
-  includeSetupInUnitCost: boolean;
-  shippingBufferPerUnit: number;
-  markupPercent: number;
+/** Sell Price = Base Cost × (1 + Markup %), rounded to cents. */
+export function computeSellPrice(baseCost: number, markupPercent: number): number {
+  return Math.round(baseCost * (1 + markupPercent / 100) * 100) / 100;
 }
 
-export interface PricingEngineResult {
-  setupAllocationPerUnit: number;
-  unitCost: number;
-  finalSellingPrice: number;
-}
-
-/**
- * Strict two-step calculation, per the approved design — markup is applied
- * ONLY at the end, to the cumulative unit cost, never to the base tier price
- * alone:
- *
- *   Step 1: unitCost = baseTierPrice + printUnitCost
- *                       + (includeSetup ? setupFee / tierQuantity : 0)
- *                       + shippingBufferPerUnit
- *   Step 2: finalSellingPrice = unitCost * (1 + markupPercent / 100)
- */
-export function computeTierPricing(input: PricingEngineInput): PricingEngineResult {
-  const setupAllocationPerUnit =
-    input.includeSetupInUnitCost && input.tierQuantity > 0 ? input.setupFee / input.tierQuantity : 0;
-
-  const unitCost = input.baseTierPrice + input.printUnitCost + setupAllocationPerUnit + input.shippingBufferPerUnit;
-
-  const finalSellingPrice = Math.round(unitCost * (1 + input.markupPercent / 100) * 100) / 100;
-
-  return { setupAllocationPerUnit, unitCost, finalSellingPrice };
+/** A {quantity, price} cost tier's sell price, using that tier's own markup %. */
+export function computeTierSellPrice(
+  tier: { quantity: number; price: number | string },
+  config: ResolvedPricingConfig
+): number {
+  return computeSellPrice(toNumber(tier.price), resolveMarkupPercentForTier(config, tier.quantity));
 }
 
 function toNumber(value: number | string | undefined): number {
   if (typeof value === "number") return Number.isFinite(value) ? value : 0;
   const parsed = parseFloat(String(value));
   return Number.isFinite(parsed) ? parsed : 0;
-}
-
-/**
- * Finds the additional_costs[] entry a product's pricing config points at
- * (by id), or null if none is selected / the id no longer matches anything
- * (e.g. the product's branding options changed on a later Trends sync).
- */
-export function resolveSelectedAdditionalCost(
-  additionalCosts: AdditionalCostOption[] | undefined,
-  selectedAdditionalCostId: number | null
-): AdditionalCostOption | null {
-  // `0` is the deliberate "None / Unbranded" sentinel (see findDefaultAdditionalCost
-  // callers) — no real Trends additional_costs[].id is ever 0, so `!selectedAdditionalCostId`
-  // correctly treats both `0` and `null` as "no cost to apply" without conflating them
-  // upstream: callers must still distinguish `null` ("never chosen, use the Screen Print
-  // default") from `0` ("explicitly chose None") when resolving an override.
-  if (!selectedAdditionalCostId || !Array.isArray(additionalCosts)) return null;
-  // Trends' additional_costs[].id is typed number | string defensively — compare
-  // numerically so a stored numeric id still matches a stringified one.
-  return additionalCosts.find((c) => Number(c.id) === selectedAdditionalCostId) || null;
-}
-
-/**
- * Convenience wrapper: resolves the selected additional cost option AND this
- * specific tier's markup %, and runs the {quantity, price} tier through
- * computeTierPricing in one call.
- */
-export function computeTierPricingFromTier(
-  tier: { quantity: number; price: number | string },
-  additionalCosts: AdditionalCostOption[] | undefined,
-  config: ResolvedPricingConfig
-): PricingEngineResult {
-  const selected = resolveSelectedAdditionalCost(additionalCosts, config.selectedAdditionalCostId);
-  return computeTierPricing({
-    baseTierPrice: toNumber(tier.price),
-    tierQuantity: tier.quantity,
-    printUnitCost: toNumber(selected?.unit_price),
-    setupFee: toNumber(selected?.setup_price),
-    includeSetupInUnitCost: config.includeSetupInUnitCost,
-    shippingBufferPerUnit: config.shippingBufferPerUnit,
-    markupPercent: resolveMarkupPercentForTier(config, tier.quantity),
-  });
 }
 
 export interface SupplierTier {
@@ -207,25 +132,4 @@ export function filterOverriddenTierMarkups(
     }
   }
   return filtered;
-}
-
-/**
- * Picks the default branding option when a product has no selection yet:
- * prefers an exact "Rotary Screen Print" match, then any "Screen Print"
- * match, else null (falls through to "None" / unbranded — printUnitCost and
- * setupFee both 0).
- */
-export function findDefaultAdditionalCost(
-  additionalCosts: AdditionalCostOption[] | undefined
-): AdditionalCostOption | null {
-  if (!Array.isArray(additionalCosts) || additionalCosts.length === 0) return null;
-
-  const matches = (pattern: RegExp, c: AdditionalCostOption) =>
-    pattern.test(c.description || "") || pattern.test(c.branding_option || "");
-
-  const rotaryMatch = additionalCosts.find((c) => matches(/rotary\s*screen\s*print/i, c));
-  if (rotaryMatch) return rotaryMatch;
-
-  const screenPrintMatch = additionalCosts.find((c) => matches(/screen\s*print/i, c));
-  return screenPrintMatch || null;
 }
