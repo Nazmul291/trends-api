@@ -17,6 +17,13 @@ import {
   resetSyncCursor,
 } from "../../server/services/chunk-sync.service";
 import { activateVolumePricingDiscount } from "../../server/services/discount-activation.service";
+import {
+  buildBrandingOptions,
+  findServiceProducts,
+  initializeBrandingService,
+  syncBrandingMetafieldsToProducts,
+  type BrandingOption,
+} from "../../server/services/branding-service.server";
 import { buildCronExpression } from "../../shared/utils/cron";
 import type { Region } from "../../shared/types/trends.types";
 import { ALL_REGIONS } from "../../shared/types/trends.types";
@@ -221,8 +228,27 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   const primaryLocId = locations.find((l) => l.isPrimary)?.id || locations[0]?.id || "";
 
+  let brandingService: {
+    connected: boolean;
+    brandingProductId: string | null;
+    setupProductId: string | null;
+    options: BrandingOption[];
+  } = { connected: false, brandingProductId: null, setupProductId: null, options: [] };
+  try {
+    const products = await findServiceProducts(admin);
+    brandingService = {
+      connected: Boolean(products.run && products.setup),
+      brandingProductId: products.run?.id ?? null,
+      setupProductId: products.setup?.id ?? null,
+      options: buildBrandingOptions(products),
+    };
+  } catch (err) {
+    console.warn("[Settings] Failed to look up the branding service products:", err);
+  }
+
   return {
     shop,
+    brandingService,
     trendsApiKey: settings.trendsApiKey ?? "",
     enableTrendsMockFallback: settings.enableTrendsMockFallback,
     enabledRegions: settings.enabledRegions,
@@ -288,6 +314,62 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         message: null,
         status: "error",
         error: err instanceof Error ? err.message : "Failed to activate volume pricing discount.",
+      };
+    }
+  }
+
+  // 1a1. Find-or-create the hidden branding service product (+ the
+  // branding.options metafield definition). Idempotent.
+  if (actionType === "initBrandingService") {
+    try {
+      const result = await initializeBrandingService(admin, shop);
+      const methods = result.options.map((o) => o.name).join(", ") || "none";
+      return {
+        success: true,
+        actionType: "initBrandingService",
+        message:
+          `Custom Branding product ${result.created.run ? "created" : "connected"}, ` +
+          `Setup Charge product ${result.created.setup ? "created" : "connected"}. Linked methods: ${methods}.`,
+        warnings: result.warnings,
+        error: null,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        actionType: "initBrandingService",
+        message: null,
+        error: err instanceof Error ? err.message : "Failed to initialize the branding service.",
+      };
+    }
+  }
+
+  // 1a2. Stamp branding.options onto every synced product.
+  if (actionType === "syncBrandingMetafields") {
+    try {
+      const result = await syncBrandingMetafieldsToProducts({ admin, shop });
+      const failed = result.failures.length;
+      return {
+        success: failed === 0,
+        actionType: "syncBrandingMetafields",
+        message:
+          `Branding options written to ${result.updatedCount} of ${result.totalProducts} synced product(s) — ` +
+          `${result.withBrandingCount} support at least one method, the rest got none.` +
+          (result.missingSupplierDataCount
+            ? ` ${result.missingSupplierDataCount} had no Trends branding data on record; resync them to pick up their methods.`
+            : ""),
+        error: failed
+          ? `${failed} product(s) failed: ${result.failures
+              .slice(0, 5)
+              .map((f) => `${f.productId} (${f.error})`)
+              .join("; ")}${failed > 5 ? "…" : ""}`
+          : null,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        actionType: "syncBrandingMetafields",
+        message: null,
+        error: err instanceof Error ? err.message : "Failed to sync branding metafields.",
       };
     }
   }
@@ -484,11 +566,18 @@ export default function SettingsPage() {
     totalCatalogPages,
     syncCursorStatus,
     lastChunkProcessedAt,
+    brandingService,
   } = useLoaderData<typeof loader>();
 
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
   const isSubmitting = navigation.state === "submitting";
+  const submittingActionType = isSubmitting ? navigation.formData?.get("actionType") : null;
+  const brandingResult =
+    actionData?.actionType === "initBrandingService" || actionData?.actionType === "syncBrandingMetafields"
+      ? actionData
+      : null;
+  const brandingWarnings = brandingResult && "warnings" in brandingResult ? brandingResult.warnings ?? [] : [];
 
   // Controlled form state
   const [apiKey, setApiKey] = useState(trendsApiKey ?? "");
@@ -2771,6 +2860,163 @@ export default function SettingsPage() {
             )}
           </div>
         )}
+      </section>
+
+      {/* ----------------------------------------------------------------- */}
+      {/* SECTION: Custom Branding Service                                  */}
+      {/* ----------------------------------------------------------------- */}
+      <section
+        style={{
+          backgroundColor: "#ffffff",
+          border: "1px solid #e1e3e5",
+          borderRadius: "12px",
+          padding: "24px",
+          boxShadow: "0 1px 3px rgba(0,0,0,0.03)",
+          display: "flex",
+          flexDirection: "column",
+          gap: "16px",
+        }}
+      >
+        <div>
+          <h2
+            style={{
+              margin: "0 0 6px 0",
+              fontSize: "16px",
+              fontWeight: 700,
+              color: "#202223",
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+            }}
+          >
+            <span>🎨</span> Custom Branding Service
+            <span
+              style={{
+                fontSize: "11px",
+                fontWeight: 700,
+                textTransform: "uppercase",
+                letterSpacing: "0.5px",
+                padding: "3px 8px",
+                borderRadius: "12px",
+                backgroundColor: brandingService.connected ? "#e6f4ea" : "#f1f2f3",
+                color: brandingService.connected ? "#166534" : "#6d7175",
+                border: `1px solid ${brandingService.connected ? "#a3d9c9" : "#e1e3e5"}`,
+              }}
+            >
+              {brandingService.connected ? "Connected" : "Not connected"}
+            </span>
+          </h2>
+          <p style={{ margin: 0, fontSize: "13px", color: "#6d7175" }}>
+            Branding is sold through two hidden (unlisted) products: &quot;Custom Branding&quot; (per-unit run
+            charges) and &quot;Setup Charge&quot; (one-time setup fees). Each synced product gets a{" "}
+            <code>branding.options</code> metafield linking every method&apos;s run-charge variant to its setup-fee
+            variant, readable from Liquid and the Storefront API. After editing either product&apos;s prices in
+            Shopify, re-run the bulk sync to push the new prices to every product.
+          </p>
+        </div>
+
+        {brandingService.options.length > 0 && (
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px" }}>
+            <thead>
+              <tr style={{ color: "#6d7175", textAlign: "left" }}>
+                <th style={{ padding: "4px 6px" }}>Method</th>
+                <th style={{ padding: "4px 6px" }}>Fee type</th>
+                <th style={{ padding: "4px 6px", textAlign: "right" }}>Setup</th>
+                <th style={{ padding: "4px 6px", textAlign: "right" }}>Run charge / unit</th>
+              </tr>
+            </thead>
+            <tbody>
+              {brandingService.options.map((o) => (
+                <tr key={o.method_id} style={{ borderTop: "1px solid #e1e3e5" }}>
+                  <td style={{ padding: "6px", fontWeight: 600 }}>{o.name}</td>
+                  <td style={{ padding: "6px", color: "#6d7175" }}>{o.fee_type}</td>
+                  <td style={{ padding: "6px", textAlign: "right" }}>${o.setup_cost.toFixed(2)}</td>
+                  <td style={{ padding: "6px", textAlign: "right" }}>${o.unit_run_charge.toFixed(2)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+
+        <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "center" }}>
+          <Form method="post">
+            <input type="hidden" name="actionType" value="initBrandingService" />
+            <button
+              type="submit"
+              disabled={isSubmitting}
+              style={{
+                padding: "8px 16px",
+                fontSize: "13px",
+                fontWeight: 600,
+                color: isSubmitting ? "#6d7175" : "#008060",
+                backgroundColor: isSubmitting ? "#f1f2f3" : "#e6f4ea",
+                border: "1px solid #a3d9c9",
+                borderRadius: "8px",
+                cursor: isSubmitting ? "not-allowed" : "pointer",
+              }}
+            >
+              {submittingActionType === "initBrandingService"
+                ? "Connecting…"
+                : brandingService.connected
+                ? "Reconnect Branding Service"
+                : "Initialize / Connect Branding Service"}
+            </button>
+          </Form>
+          <Form method="post">
+            <input type="hidden" name="actionType" value="syncBrandingMetafields" />
+            <button
+              type="submit"
+              disabled={isSubmitting || !brandingService.connected}
+              title={brandingService.connected ? undefined : "Connect the branding service first"}
+              style={{
+                padding: "8px 16px",
+                fontSize: "13px",
+                fontWeight: 600,
+                color: isSubmitting || !brandingService.connected ? "#6d7175" : "#202223",
+                backgroundColor: isSubmitting || !brandingService.connected ? "#f1f2f3" : "#ffffff",
+                border: "1px solid #babfc3",
+                borderRadius: "8px",
+                cursor: isSubmitting || !brandingService.connected ? "not-allowed" : "pointer",
+              }}
+            >
+              {submittingActionType === "syncBrandingMetafields"
+                ? "Syncing branding…"
+                : "Bulk Sync Branding to All Synced Products"}
+            </button>
+          </Form>
+          {brandingService.brandingProductId && (
+            <a
+              href={`shopify:admin/products/${brandingService.brandingProductId.split("/").pop()}`}
+              target="_top"
+              style={{ fontSize: "12px", color: "#2c6ecb" }}
+            >
+              Edit Custom Branding product
+            </a>
+          )}
+          {brandingService.setupProductId && (
+            <a
+              href={`shopify:admin/products/${brandingService.setupProductId.split("/").pop()}`}
+              target="_top"
+              style={{ fontSize: "12px", color: "#2c6ecb" }}
+            >
+              Edit Setup Charge product
+            </a>
+          )}
+        </div>
+
+        {brandingResult?.success && brandingResult.message && (
+          <div style={{ fontSize: "13px", color: "#166534", fontWeight: 600 }}>✅ {brandingResult.message}</div>
+        )}
+        {brandingResult && !brandingResult.success && (
+          <div style={{ fontSize: "13px", color: "#991b1b", fontWeight: 600 }}>
+            {brandingResult.message && <div>{brandingResult.message}</div>}❌ {brandingResult.error}
+          </div>
+        )}
+        {brandingWarnings.map((w) => (
+          <div key={w} style={{ fontSize: "12px", color: "#b45309" }}>
+            ⚠️ {w}
+          </div>
+        ))}
       </section>
 
       {/* ----------------------------------------------------------------- */}

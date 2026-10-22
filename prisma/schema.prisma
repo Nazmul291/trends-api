@@ -60,6 +60,14 @@ model TrendProductSync {
   /// (defaults to a Screen Print match if one exists; see
   /// shared/utils/pricing-engine.ts's findDefaultAdditionalCost()).
   selectedAdditionalCostId Int?
+  /// true once the merchant edits/adds/removes quantity tiers — the sync
+  /// pipeline then prices against customTierQuantities instead of the Trends
+  /// API's own quantity breaks, and resyncs never overwrite them. Each custom
+  /// tier's base cost is still resolved live from the supplier's applicable
+  /// break (see pricing-engine.ts's buildEffectiveTiers), and its markup lives
+  /// in tierMarkups like any other tier.
+  isCustomTiers        Boolean  @default(false)
+  customTierQuantities Int[]    @default([])
 
   lastSyncedAt     DateTime           @default(now())
   createdAt        DateTime           @default(now())

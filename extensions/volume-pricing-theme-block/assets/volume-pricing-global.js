@@ -458,6 +458,356 @@
     }, delay);
   }
 
+  // ---------------------------------------------------------------------
+  // Custom branding selector (blocks/branding_selector.liquid)
+  // ---------------------------------------------------------------------
+  // The selected method's run-charge variant (hidden "Custom Branding"
+  // product) and its linked setup-fee variant (hidden "Setup Charge"
+  // product) ride along in the SAME /cart/add request as the product itself
+  // — one atomic add, so the cart can never end up with branded items but no
+  // branding charges.
+  var PRODUCT_FORM_SELECTOR = 'form[action*="/cart/add"]';
+  var brandingState = null;
+
+  // The product form for THIS product (not a quick-add form elsewhere on the
+  // page). form.elements includes inputs attached via a `form="…"`
+  // attribute — Dawn's quantity input lives outside the <form> that way.
+  function readProductQuantity() {
+    var forms = document.querySelectorAll(PRODUCT_FORM_SELECTOR);
+    for (var i = 0; i < forms.length; i++) {
+      var idField = forms[i].elements.namedItem('id');
+      if (!idField || !brandingState || brandingState.variantIds.indexOf(Number(idField.value)) === -1) continue;
+      var qtyField = forms[i].elements.namedItem('quantity');
+      return Math.max(1, parseInt(qtyField && qtyField.value, 10) || 1);
+    }
+    return 1;
+  }
+
+  function fillTemplate(template, values) {
+    return String(template || '').replace(/__([a-z])__/g, function (match, key) {
+      return Object.prototype.hasOwnProperty.call(values, key) ? values[key] : match;
+    });
+  }
+
+  function initBrandingSelector() {
+    var root = document.querySelector('[data-branding-selector]');
+    brandingState = null;
+    if (!root) return;
+
+    var select = root.querySelector('#branding-method-select');
+    var qtyWrapper = root.querySelector('#branding-qty-wrapper');
+    var multiplierLabel = root.querySelector('#branding-multiplier-label');
+    var multiplierInput = root.querySelector('#branding-multiplier-input');
+    var summary = root.querySelector('#branding-breakdown-summary');
+    var errorEl = root.querySelector('[data-branding-error]');
+    if (!select || !qtyWrapper || !multiplierInput || !summary) {
+      logVisible('warn', 'branding selector markup is incomplete — branding charges are disabled.', root);
+      return;
+    }
+
+    var data = root.dataset;
+    var moneyTemplate = data.moneyTemplate;
+    var variantIds = String(data.variantIds || '')
+      .split(',')
+      .map(Number)
+      .filter(Boolean);
+
+    function money(amount) {
+      return formatMoneyLike(amount, moneyTemplate, data.currencySymbol);
+    }
+
+    function multiplierLabelFor(feeType) {
+      return feeType === 'PER_POSITION' ? data.positionLabel : data.colourLabel;
+    }
+
+    // The chosen "Custom Branding" method plus the "Setup Charge" variant the
+    // metafield links it to — re-read on every change, so the setup charge
+    // always follows the selected method and multiplier.
+    function currentSelection() {
+      var option = select.options[select.selectedIndex];
+      if (!option || !option.value) return null;
+      var brandingVariantId = Number(option.dataset.brandingVariant);
+      var setupVariantId = Number(option.dataset.setupVariant);
+      if (!brandingVariantId || !setupVariantId) return null;
+      return {
+        name: option.dataset.name || option.textContent.trim(),
+        feeType: option.dataset.feeType,
+        brandingVariantId: brandingVariantId,
+        unitRunCharge: Number(option.dataset.unitRunCharge) || 0,
+        setupVariantId: setupVariantId,
+        setupCost: Number(option.dataset.setupCost) || 0,
+        multiplier: Math.max(1, parseInt(multiplierInput.value, 10) || 1),
+      };
+    }
+
+    function render() {
+      var selection = currentSelection();
+      qtyWrapper.hidden = !selection;
+      summary.hidden = !selection;
+      if (!selection) return;
+
+      if (multiplierLabel) multiplierLabel.textContent = multiplierLabelFor(selection.feeType);
+
+      var productQty = readProductQuantity();
+      var totalSetup = selection.multiplier * selection.setupCost;
+      var totalRun = productQty * selection.multiplier * selection.unitRunCharge;
+      var lines = {
+        '[data-branding-setup-line]': fillTemplate(data.setupTemplate, {
+          m: selection.multiplier,
+          c: money(selection.setupCost),
+          t: money(totalSetup),
+        }),
+        '[data-branding-run-line]': fillTemplate(data.runTemplate, {
+          q: productQty,
+          m: selection.multiplier,
+          c: money(selection.unitRunCharge),
+          t: money(totalRun),
+        }),
+        '[data-branding-total-line]': fillTemplate(data.totalTemplate, { t: money(totalSetup + totalRun) }),
+      };
+      for (var selector in lines) {
+        var el = summary.querySelector(selector);
+        if (el && el.textContent !== lines[selector]) el.textContent = lines[selector];
+      }
+    }
+
+    function showError(message) {
+      if (!errorEl) return;
+      errorEl.textContent = message || '';
+      errorEl.hidden = !message;
+    }
+
+    select.addEventListener('change', function () {
+      showError('');
+      render();
+    });
+    multiplierInput.addEventListener('input', render);
+    multiplierInput.addEventListener('change', function () {
+      multiplierInput.value = Math.max(1, parseInt(multiplierInput.value, 10) || 1);
+      render();
+    });
+
+    brandingState = {
+      variantIds: variantIds,
+      productTitle: data.productTitle,
+      propertyBranding: data.propertyBranding || 'Branding',
+      propertyFor: data.propertyFor || 'For',
+      addError: data.addError,
+      currentSelection: currentSelection,
+      multiplierLabelFor: multiplierLabelFor,
+      render: render,
+      showError: showError,
+    };
+
+    render();
+    root.setAttribute('data-branding-ready', '');
+  }
+
+  // Normalizes a /cart/add body (FormData, URLSearchParams, urlencoded or
+  // JSON string) to { items, extras, singleItem }, or null when it's a shape
+  // we can't safely rewrite (form-encoded items[], file uploads, unknown).
+  function parseCartAddBody(body) {
+    if (typeof body === 'string') {
+      var trimmed = body.trim();
+      if (trimmed.charAt(0) === '{') {
+        var json;
+        try {
+          json = JSON.parse(trimmed);
+        } catch (err) {
+          return null;
+        }
+        var jsonExtras = {};
+        if (json.sections !== undefined) jsonExtras.sections = json.sections;
+        if (json.sections_url !== undefined) jsonExtras.sections_url = json.sections_url;
+        if (Array.isArray(json.items)) {
+          return { items: json.items.slice(), extras: jsonExtras, singleItem: false };
+        }
+        if (!json.id) return null;
+        var jsonItem = { id: Number(json.id), quantity: Number(json.quantity) || 1 };
+        if (json.properties) jsonItem.properties = json.properties;
+        if (json.selling_plan) jsonItem.selling_plan = json.selling_plan;
+        return { items: [jsonItem], extras: jsonExtras, singleItem: true };
+      }
+      body = new URLSearchParams(trimmed);
+    }
+
+    var isFormLike =
+      (typeof FormData !== 'undefined' && body instanceof FormData) ||
+      (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams);
+    if (!isFormLike) return null;
+
+    var item = { quantity: 1 };
+    var properties = {};
+    var hasProperties = false;
+    var extras = {};
+    var entries = Array.from(body.entries());
+    for (var i = 0; i < entries.length; i++) {
+      var key = entries[i][0];
+      var value = entries[i][1];
+      if (typeof value !== 'string') return null;
+      if (key.indexOf('items[') === 0) return null;
+      var propertyMatch = key.match(/^properties\[(.+)\]$/);
+      if (propertyMatch) {
+        properties[propertyMatch[1]] = value;
+        hasProperties = true;
+      } else if (key === 'id') {
+        item.id = Number(value);
+      } else if (key === 'quantity') {
+        item.quantity = Math.max(1, parseInt(value, 10) || 1);
+      } else if (key === 'selling_plan' && value) {
+        item.selling_plan = value;
+      } else if (key === 'sections' || key === 'sections_url') {
+        extras[key] = value;
+      }
+    }
+    if (!item.id) return null;
+    if (hasProperties) item.properties = properties;
+    return { items: [item], extras: extras, singleItem: true };
+  }
+
+  // Appends the branding lines to a parsed add request, or returns null when
+  // no branding is selected / the request isn't for this page's product.
+  function buildBrandedItems(parsed) {
+    if (!brandingState || !parsed) return null;
+    var selection = brandingState.currentSelection();
+    if (!selection) return null;
+
+    var mainItem = null;
+    for (var i = 0; i < parsed.items.length; i++) {
+      if (brandingState.variantIds.indexOf(Number(parsed.items[i].id)) !== -1) {
+        mainItem = parsed.items[i];
+        break;
+      }
+    }
+    if (!mainItem) return null;
+
+    var multiplierKey = String(brandingState.multiplierLabelFor(selection.feeType) || '').replace(/:\s*$/, '');
+    var brandingProps = {};
+    brandingProps[brandingState.propertyBranding] = selection.name;
+    brandingProps[multiplierKey] = String(selection.multiplier);
+
+    mainItem.properties = Object.assign({}, mainItem.properties || {}, brandingProps);
+
+    var chargeProps = Object.assign({}, brandingProps);
+    chargeProps[brandingState.propertyFor] = brandingState.productTitle;
+    // Hidden (underscore) property: ties the charge lines to the branded
+    // variant, and keeps two branded products' charges on separate lines.
+    chargeProps._branding_parent_variant = String(mainItem.id);
+
+    var productQty = Math.max(1, Number(mainItem.quantity) || 1);
+    // Order: main product, "Custom Branding" run charge (product qty ×
+    // multiplier units), then its linked "Setup Charge" (multiplier units).
+    var items = parsed.items.concat([
+      { id: selection.brandingVariantId, quantity: productQty * selection.multiplier, properties: chargeProps },
+      { id: selection.setupVariantId, quantity: selection.multiplier, properties: chargeProps },
+    ]);
+    return { items: items, mainVariantId: Number(mainItem.id) };
+  }
+
+  // A multi-item /cart/add returns { items: [...] }, but a theme that posted
+  // a single `id` expects the single line-item shape back (Dawn reads
+  // response.key / response.sections). Re-shape it to the branded product's
+  // own line so the theme's success handling works unchanged.
+  function adaptBrandedResponse(response, parsed, mainVariantId) {
+    if (!parsed.singleItem || !response.ok) return response;
+    return response
+      .clone()
+      .json()
+      .then(function (json) {
+        var lines = (json && json.items) || [];
+        var mainLine = null;
+        for (var i = 0; i < lines.length; i++) {
+          if (Number(lines[i].variant_id) === mainVariantId) {
+            mainLine = lines[i];
+            break;
+          }
+        }
+        if (!mainLine) return response;
+        var shaped = Object.assign({}, mainLine);
+        if (json.sections !== undefined) shaped.sections = json.sections;
+        return new Response(JSON.stringify(shaped), {
+          status: response.status,
+          statusText: response.statusText,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      })
+      .catch(function () {
+        return response;
+      });
+  }
+
+  function bundleBrandingIntoAddRequest(init) {
+    if (!init || !init.body) return null;
+    var parsed = parseCartAddBody(init.body);
+    var branded = buildBrandedItems(parsed);
+    if (!branded) return null;
+
+    var headers = new Headers(init.headers || {});
+    headers.set('Content-Type', 'application/json');
+    var payload = Object.assign({ items: branded.items }, parsed.extras);
+    logVisible('info', 'bundling branding charges into /cart/add', payload.items);
+
+    return {
+      init: Object.assign({}, init, { headers: headers, body: JSON.stringify(payload) }),
+      adaptResponse: function (response) {
+        return adaptBrandedResponse(response, parsed, branded.mainVariantId);
+      },
+    };
+  }
+
+  // Themes without AJAX add-to-cart submit the product form natively. If no
+  // theme script claimed the submit (defaultPrevented), do the bundled add
+  // ourselves and continue to the cart page as the native submit would have.
+  function installBrandingFormSubmitHandler() {
+    if (window.__volumePricingBrandingSubmitWrapped) return;
+    window.__volumePricingBrandingSubmitWrapped = true;
+
+    document.addEventListener('submit', function (event) {
+      var form = event.target;
+      if (event.defaultPrevented || !brandingState || !form || !form.matches) return;
+      if (!form.matches(PRODUCT_FORM_SELECTOR)) return;
+
+      var parsed = parseCartAddBody(new FormData(form));
+      var branded = buildBrandedItems(parsed);
+      if (!branded) return;
+
+      event.preventDefault();
+      brandingState.showError('');
+      var root = (window.Shopify && window.Shopify.routes && window.Shopify.routes.root) || '/';
+      fetch(root + 'cart/add.js', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-Volume-Pricing-Internal': '1' },
+        body: JSON.stringify({ items: branded.items }),
+      })
+        .then(function (res) {
+          if (res.ok) {
+            window.location.href = root + 'cart';
+            return;
+          }
+          return res.json().then(function (err) {
+            brandingState.showError((err && (err.description || err.message)) || brandingState.addError);
+          });
+        })
+        .catch(function () {
+          if (brandingState) brandingState.showError(brandingState.addError);
+        });
+    });
+
+    // The run charge scales with the product quantity, so keep the
+    // breakdown live as the shopper changes it.
+    function onQuantityEvent(event) {
+      if (brandingState && event.target && event.target.matches && event.target.matches(QUANTITY_SELECTOR)) {
+        brandingState.render();
+      }
+    }
+    document.addEventListener('input', onQuantityEvent);
+    document.addEventListener('change', onQuantityEvent);
+    // Quantity steppers (+/-) often set the value without firing input/change.
+    document.addEventListener('click', function () {
+      if (brandingState) setTimeout(brandingState.render, 0);
+    });
+  }
+
   // Direct, theme-agnostic trigger for cart mutations: Dawn (and most themes)
   // call these endpoints via fetch for add/change/clear regardless of
   // whether a given UI control (e.g. a quantity stepper button, vs. typing
@@ -472,9 +822,12 @@
 
     var originalFetch = window.fetch;
     window.fetch = function (resource, init) {
-      var promise = originalFetch.apply(this, arguments);
       var url = typeof resource === 'string' ? resource : (resource && resource.url) || '';
       var isInternal = init && init.headers && init.headers['X-Volume-Pricing-Internal'];
+      var bundled = !isInternal && /\/cart\/add(\.js)?(\?|$)/.test(url) ? bundleBrandingIntoAddRequest(init) : null;
+      var promise = bundled
+        ? originalFetch.call(this, resource, bundled.init).then(bundled.adaptResponse)
+        : originalFetch.apply(this, arguments);
       if (!isInternal && /\/cart\/(add|change|clear)(\.js)?(\?|$)/.test(url)) {
         promise
           .then(function () {
@@ -760,6 +1113,8 @@
 
   function boot() {
     installCartAjaxInterceptor();
+    installBrandingFormSubmitHandler();
+    initBrandingSelector();
     initProductPage();
     initCart();
   }

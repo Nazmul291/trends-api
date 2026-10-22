@@ -1,0 +1,98 @@
+.branding-selector {
+  display: none;
+  flex-direction: column;
+  gap: 12px;
+  margin: 16px 0;
+  padding: 16px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 8px;
+}
+
+/* Revealed by volume-pricing-global.js once it's running, so the selector
+   never shows without the script that adds its charges to the cart. */
+.branding-selector[data-branding-ready] {
+  display: flex;
+}
+
+.branding-selector__title {
+  margin: 0;
+  font-size: 1.1em;
+}
+
+.branding-selector__field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.branding-selector__field[hidden],
+.branding-selector__summary[hidden],
+.branding-selector__error[hidden] {
+  display: none;
+}
+
+.branding-selector__label {
+  font-weight: 600;
+  font-size: 0.95em;
+}
+
+.branding-selector__select,
+.branding-selector__input {
+  min-height: 44px;
+  padding: 8px 12px;
+  font: inherit;
+  border: 1px solid rgba(0, 0, 0, 0.3);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+}
+
+.branding-selector__input {
+  max-width: 120px;
+}
+
+.branding-selector__select:focus-visible,
+.branding-selector__input:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+.branding-selector__summary {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.04);
+  font-size: 0.95em;
+}
+
+.branding-selector__line {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.branding-selector__line--total {
+  margin-top: 4px;
+  font-weight: 700;
+}
+
+.branding-selector__note {
+  margin: 4px 0 0;
+  font-size: 0.85em;
+  opacity: 0.75;
+}
+
+.branding-selector__error {
+  margin: 0;
+  color: #b42318;
+  font-weight: 600;
+}
+
+.branding-selector__editor-note {
+  margin: 8px 0;
+  padding: 8px 12px;
+  border: 1px dashed rgba(0, 0, 0, 0.3);
+  border-radius: 6px;
+  font-size: 0.85em;
+}

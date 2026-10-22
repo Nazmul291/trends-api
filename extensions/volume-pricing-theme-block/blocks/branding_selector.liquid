@@ -1,0 +1,119 @@
+{%- liquid
+  assign branding_options = product.metafields.branding.options.value
+  assign has_branding = false
+  if branding_options and branding_options.size > 0
+    assign has_branding = true
+  endif
+-%}
+
+{%- if has_branding -%}
+  <div
+    class="branding-selector"
+    data-branding-selector
+    data-product-title="{{ product.title | escape }}"
+    data-variant-ids="{{ product.variants | map: 'id' | join: ',' }}"
+    data-money-template="{{ 100 | money | strip_html | escape }}"
+    data-currency-symbol="{{ cart.currency.symbol | escape }}"
+    data-colour-label="{{ 'branding.colour_label' | t | escape }}"
+    data-position-label="{{ 'branding.position_label' | t | escape }}"
+    data-setup-template="{{ 'branding.setup_line' | t: multiplier: '__m__', cost: '__c__', total: '__t__' | escape }}"
+    data-run-template="{{ 'branding.run_line' | t: quantity: '__q__', multiplier: '__m__', cost: '__c__', total: '__t__' | escape }}"
+    data-total-template="{{ 'branding.total_line' | t: total: '__t__' | escape }}"
+    data-property-branding="{{ 'branding.property_branding' | t | escape }}"
+    data-property-for="{{ 'branding.property_for' | t | escape }}"
+    data-add-error="{{ 'branding.add_error' | t | escape }}"
+    {{ block.shopify_attributes }}
+  >
+    {%- if block.settings.heading != blank -%}
+      <h3 class="branding-selector__title">{{ block.settings.heading | escape }}</h3>
+    {%- endif -%}
+
+    <div class="branding-selector__field">
+      <label class="branding-selector__label" for="branding-method-select">
+        {{- 'branding.method_label' | t -}}
+      </label>
+      <select id="branding-method-select" class="branding-selector__select">
+        <option value="">{{ 'branding.no_branding' | t }}</option>
+        {%- for option in branding_options -%}
+          {%- liquid
+            assign branding_gid = option.branding_variant_id | default: option.run_charge_variant_id
+            assign unit_run_charge = option.unit_run_charge | default: option.run_charge_cost | default: 0
+            assign method_id = option.method_id | default: option.method
+            assign branding_variant_id = branding_gid | split: '/' | last
+            assign setup_variant_id = option.setup_variant_id | split: '/' | last
+            if branding_variant_id == blank or setup_variant_id == blank
+              continue
+            endif
+            assign setup_cents = option.setup_cost | default: 0 | times: 100 | round
+            assign run_cents = unit_run_charge | times: 100 | round
+            assign setup_money = setup_cents | money
+            assign run_money = run_cents | money
+          -%}
+          <option
+            value="{{ method_id | escape }}"
+            data-name="{{ option.name | escape }}"
+            data-branding-variant="{{ branding_variant_id }}"
+            data-unit-run-charge="{{ unit_run_charge }}"
+            data-setup-variant="{{ setup_variant_id }}"
+            data-setup-cost="{{ option.setup_cost | default: 0 }}"
+            data-fee-type="{{ option.fee_type | escape }}"
+          >
+            {{- 'branding.option_label' | t: name: option.name, setup: setup_money, run: run_money | escape -}}
+          </option>
+        {%- endfor -%}
+      </select>
+    </div>
+
+    <div id="branding-qty-wrapper" class="branding-selector__field" hidden>
+      <label id="branding-multiplier-label" class="branding-selector__label" for="branding-multiplier-input">
+        {{- 'branding.colour_label' | t -}}
+      </label>
+      <input
+        type="number"
+        id="branding-multiplier-input"
+        class="branding-selector__input"
+        min="1"
+        max="12"
+        step="1"
+        value="1"
+        inputmode="numeric"
+      >
+    </div>
+
+    <div id="branding-breakdown-summary" class="branding-selector__summary" aria-live="polite" hidden>
+      <p class="branding-selector__line" data-branding-setup-line></p>
+      <p class="branding-selector__line" data-branding-run-line></p>
+      <p class="branding-selector__line branding-selector__line--total" data-branding-total-line></p>
+      <p class="branding-selector__note">{{ 'branding.cart_note' | t }}</p>
+    </div>
+
+    <p class="branding-selector__error" data-branding-error role="alert" hidden></p>
+
+    <script type="application/json" id="branding-metafield-data">
+      {{ branding_options | json }}
+    </script>
+  </div>
+
+  {%- if request.design_mode -%}
+    <p class="branding-selector__editor-note">{{ 'branding.editor_note' | t }}</p>
+  {%- endif -%}
+{%- endif -%}
+
+{% schema %}
+{
+  "name": "t:branding_selector.name",
+  "target": "section",
+  "enabled_on": {
+    "templates": ["product"]
+  },
+  "stylesheet": "branding-selector.css",
+  "settings": [
+    {
+      "type": "text",
+      "id": "heading",
+      "label": "t:branding_selector.settings.heading.label",
+      "default": "Branding & setup options"
+    }
+  ]
+}
+{% endschema %}

@@ -35,6 +35,8 @@ export interface ResolvedPricingConfig {
   includeSetupInUnitCost: boolean;
   shippingBufferPerUnit: number;
   selectedAdditionalCostId: number | null;
+  /** Merchant-defined tier quantities replacing the supplier's breaks, or null to use the supplier's. */
+  customTierQuantities: number[] | null;
 }
 
 /** This tier's markup %: its own override if set, else the shop-wide default. */
@@ -126,6 +128,63 @@ export function computeTierPricingFromTier(
     shippingBufferPerUnit: config.shippingBufferPerUnit,
     markupPercent: resolveMarkupPercentForTier(config, tier.quantity),
   });
+}
+
+export interface SupplierTier {
+  quantity: number;
+  price: number;
+}
+
+/** Valid supplier quantity breaks, parsed to numbers and sorted ascending. */
+export function normalizeSupplierTiers(
+  prices: Array<{ quantity: number | string; price: number | string }> | undefined
+): SupplierTier[] {
+  if (!Array.isArray(prices)) return [];
+  return prices
+    .map((p) => ({ quantity: toNumber(p.quantity), price: toNumber(p.price) }))
+    .filter((p) => p.quantity > 0 && p.price > 0)
+    .sort((a, b) => a.quantity - b.quantity);
+}
+
+/**
+ * Supplier base cost for an arbitrary quantity: the highest supplier break at
+ * or below it. A quantity under the supplier's smallest break (below MOQ)
+ * uses that smallest break's price — the most expensive per-unit cost on offer.
+ */
+export function resolveSupplierCostForQuantity(supplierTiers: SupplierTier[], quantity: number): number {
+  if (supplierTiers.length === 0) return 0;
+  let cost = supplierTiers[0].price;
+  for (const tier of supplierTiers) {
+    if (tier.quantity <= quantity) cost = tier.price;
+    else break;
+  }
+  return cost;
+}
+
+/**
+ * The tier list actually priced and pushed to Shopify: the supplier's own
+ * breaks, or the merchant's custom quantities with each base cost resolved
+ * live from the supplier's applicable break (so supplier price changes still
+ * flow through custom tiers on resync).
+ */
+export function buildEffectiveTiers(
+  supplierTiers: SupplierTier[],
+  customTierQuantities: number[] | null
+): SupplierTier[] {
+  if (!customTierQuantities || customTierQuantities.length === 0 || supplierTiers.length === 0) {
+    return supplierTiers;
+  }
+  return [...customTierQuantities]
+    .sort((a, b) => a - b)
+    .map((quantity) => ({ quantity, price: resolveSupplierCostForQuantity(supplierTiers, quantity) }));
+}
+
+/** Positive whole numbers in strictly ascending order (which also guarantees uniqueness). */
+export function isValidTierQuantityList(quantities: number[]): boolean {
+  return (
+    quantities.length > 0 &&
+    quantities.every((q, i) => Number.isInteger(q) && q > 0 && (i === 0 || q > quantities[i - 1]))
+  );
 }
 
 /**

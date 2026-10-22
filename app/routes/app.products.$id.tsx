@@ -20,9 +20,11 @@ import { normalizePricing } from "../../shared/types/trends.types";
 import {
   computeTierPricingFromTier,
   resolveSelectedAdditionalCost,
-  resolveMarkupPercentForTier,
   findDefaultAdditionalCost,
   filterOverriddenTierMarkups,
+  normalizeSupplierTiers,
+  resolveSupplierCostForQuantity,
+  isValidTierQuantityList,
   type AdditionalCostOption,
 } from "../../shared/utils/pricing-engine";
 
@@ -125,6 +127,8 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
         includeSetupInUnitCost: true,
         shippingBufferOverride: true,
         selectedAdditionalCostId: true,
+        isCustomTiers: true,
+        customTierQuantities: true,
         lastSyncedAt: true,
       },
     });
@@ -285,6 +289,28 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       }
     }
 
+    // Only posted when the merchant's tier quantities differ from the
+    // supplier's breaks (the client holds the live Trends data to compare
+    // against); absent means "use supplier tiers."
+    let customTierQuantities: number[] = [];
+    const rawCustomTiers = formData.get("customTierQuantitiesJson");
+    if (typeof rawCustomTiers === "string" && rawCustomTiers) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(rawCustomTiers);
+      } catch {
+        parsed = null;
+      }
+      if (!Array.isArray(parsed) || !isValidTierQuantityList(parsed.map(Number))) {
+        return {
+          success: false,
+          error: "Tier quantities must be whole numbers greater than 0, unique, and in ascending order.",
+        };
+      }
+      customTierQuantities = parsed.map(Number);
+    }
+    const isCustomTiers = customTierQuantities.length > 0;
+
     // Independently verify against the shop's AppSettings rather than trust a
     // client-sent flag — a field only persists as an override when it
     // actually differs from the current global default.
@@ -299,7 +325,8 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       tierMarkups !== null ||
       includeSetupInUnitCost !== null ||
       shippingBufferOverride !== null ||
-      selectedAdditionalCostId !== null;
+      selectedAdditionalCostId !== null ||
+      isCustomTiers;
 
     try {
       const existing = await prisma.trendProductSync.findFirst({
@@ -319,6 +346,8 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
             includeSetupInUnitCost,
             shippingBufferOverride,
             selectedAdditionalCostId,
+            isCustomTiers,
+            customTierQuantities,
           },
         });
       } else {
@@ -332,6 +361,8 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
             includeSetupInUnitCost,
             shippingBufferOverride,
             selectedAdditionalCostId,
+            isCustomTiers,
+            customTierQuantities,
           },
         });
       }
@@ -349,6 +380,34 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 
   return { success: false, error: "Unknown action" };
 };
+
+/** One editable row in the Pricing & Margin tier table. `quantity` stays a string so the input can be blank mid-edit. */
+interface TierRow {
+  key: number;
+  quantity: string;
+  markupPercent: number;
+}
+
+let tierRowKeySeq = 0;
+function makeTierRow(quantity: number | "", markupPercent: number): TierRow {
+  tierRowKeySeq += 1;
+  return { key: tierRowKeySeq, quantity: String(quantity), markupPercent };
+}
+
+/** Comparable snapshot of the pricing draft — row keys excluded, quantities parsed. */
+function pricingDraftSignature(
+  rows: TierRow[],
+  includeSetup: boolean,
+  shippingBuffer: number,
+  selectedAdditionalCostId: number | null
+): string {
+  return JSON.stringify({
+    tiers: rows.map((r) => [r.quantity.trim() === "" ? null : Number(r.quantity), r.markupPercent]),
+    includeSetup,
+    shippingBuffer,
+    selectedAdditionalCostId,
+  });
+}
 
 export default function ProductDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -473,21 +532,87 @@ export default function ProductDetailPage() {
   // against the current global defaults, and persisted the same way
   // server-side in the savePricingOverride action.
   const pricingFetcher = useFetcher<typeof action>();
-  const existingTierMarkups = (productSync?.tierMarkups as Record<string, number> | null) || null;
+  const defaultMarkupPercent = globalSettings.defaultMarkupPercent ?? 35;
+  const defaultIncludeSetup = globalSettings.defaultIncludeSetupInUnitCost ?? true;
+  const defaultShippingBuffer = globalSettings.defaultShippingBufferPerUnit ?? 0.15;
   const defaultAdditionalCostId = useMemo(() => {
     const match = findDefaultAdditionalCost(additionalCosts);
     return match?.id != null ? Number(match.id) : null;
   }, [additionalCosts]);
-  const [tierMarkups, setTierMarkups] = useState<Record<string, number>>(existingTierMarkups ?? {});
-  const [includeSetup, setIncludeSetup] = useState<boolean>(
-    productSync?.includeSetupInUnitCost ?? globalSettings.defaultIncludeSetupInUnitCost ?? true
+  const supplierTiers = useMemo(
+    () => normalizeSupplierTiers(normalizePricing(product?.pricing)[0]?.prices),
+    [product]
   );
-  const [shippingBuffer, setShippingBuffer] = useState<number>(
-    productSync?.shippingBufferOverride ?? globalSettings.defaultShippingBufferPerUnit ?? 0.15
-  );
-  const [selectedAdditionalCostId, setSelectedAdditionalCostId] = useState<number | null>(
-    productSync?.selectedAdditionalCostId ?? defaultAdditionalCostId
-  );
+
+  const [tierRows, setTierRows] = useState<TierRow[]>([]);
+  const [includeSetup, setIncludeSetup] = useState<boolean>(defaultIncludeSetup);
+  const [shippingBuffer, setShippingBuffer] = useState<number>(defaultShippingBuffer);
+  const [selectedAdditionalCostId, setSelectedAdditionalCostId] = useState<number | null>(null);
+  // Signature of the last saved/loaded values; Save stays disabled while the draft matches it.
+  const [savedPricingSignature, setSavedPricingSignature] = useState<string | null>(null);
+
+  // Hydrate the drafts once BOTH the loader's productSync and the
+  // client-fetched Trends product exist — the product loads asynchronously,
+  // so a useState initializer would run before supplier tiers and branding
+  // options are known. Re-runs when a save/resync revalidation hands back a
+  // new productSync, or the page switches product.
+  const hydratedForRef = React.useRef<{ sync: unknown; code: unknown }>({ sync: undefined, code: undefined });
+  useEffect(() => {
+    if (!product) return;
+    if (hydratedForRef.current.sync === productSync && hydratedForRef.current.code === product.code) return;
+    hydratedForRef.current = { sync: productSync, code: product.code };
+
+    const savedMarkups = (productSync?.tierMarkups as Record<string, number> | null) ?? {};
+    const quantities =
+      productSync?.isCustomTiers && productSync.customTierQuantities.length > 0
+        ? productSync.customTierQuantities
+        : supplierTiers.map((t) => t.quantity);
+    const rows = quantities.map((q) => makeTierRow(q, savedMarkups[String(q)] ?? defaultMarkupPercent));
+    const savedIncludeSetup = productSync?.includeSetupInUnitCost ?? defaultIncludeSetup;
+    const savedShippingBuffer = productSync?.shippingBufferOverride ?? defaultShippingBuffer;
+    const savedAdditionalCostId = productSync?.selectedAdditionalCostId ?? defaultAdditionalCostId;
+    setTierRows(rows);
+    setIncludeSetup(savedIncludeSetup);
+    setShippingBuffer(savedShippingBuffer);
+    setSelectedAdditionalCostId(savedAdditionalCostId);
+    setSavedPricingSignature(
+      pricingDraftSignature(rows, savedIncludeSetup, savedShippingBuffer, savedAdditionalCostId)
+    );
+  }, [
+    product,
+    productSync,
+    supplierTiers,
+    defaultAdditionalCostId,
+    defaultMarkupPercent,
+    defaultIncludeSetup,
+    defaultShippingBuffer,
+  ]);
+
+  // Derived from the rows: parsed quantities (NaN for a blank/invalid input),
+  // and the quantity-keyed markup map the shared engine and the action expect.
+  const { tierQuantities, tierMarkups } = useMemo(() => {
+    const quantities = tierRows.map((r) => (r.quantity.trim() === "" ? NaN : Number(r.quantity)));
+    const markups: Record<string, number> = {};
+    tierRows.forEach((r, i) => {
+      if (Number.isInteger(quantities[i]) && quantities[i] > 0) markups[String(quantities[i])] = r.markupPercent;
+    });
+    return { tierQuantities: quantities, tierMarkups: markups };
+  }, [tierRows]);
+
+  const hasUnsavedPricingChanges =
+    savedPricingSignature !== null &&
+    pricingDraftSignature(tierRows, includeSetup, shippingBuffer, selectedAdditionalCostId) !== savedPricingSignature;
+
+  const tierError = isValidTierQuantityList(tierQuantities)
+    ? null
+    : tierRows.length === 0
+    ? "At least one tier is required."
+    : tierQuantities.some((q) => !Number.isInteger(q) || q <= 0)
+    ? "Each tier needs a whole-number quantity greater than 0."
+    : "Tier quantities must be unique and in ascending order.";
+
+  const isCustomTiersDraft =
+    tierQuantities.length !== supplierTiers.length || tierQuantities.some((q, i) => q !== supplierTiers[i].quantity);
 
   const selectedAdditionalCost = useMemo(
     () => resolveSelectedAdditionalCost(additionalCosts, selectedAdditionalCostId),
@@ -499,59 +624,76 @@ export default function ProductDetailPage() {
   // sync pipeline uses (server/services/shopify-sync.service.ts), so this
   // preview can never drift from what actually gets pushed on next sync.
   const computedTiers = useMemo(() => {
-    const groups = normalizePricing(product?.pricing);
-    const primary = groups[0];
-    if (!primary?.prices || primary.prices.length === 0) return [];
+    if (supplierTiers.length === 0) return [];
     const config = {
-      defaultMarkupPercent: globalSettings.defaultMarkupPercent,
+      defaultMarkupPercent,
       tierMarkups,
       includeSetupInUnitCost: includeSetup,
       shippingBufferPerUnit: shippingBuffer,
       selectedAdditionalCostId,
+      customTierQuantities: null,
     };
-    return primary.prices.map((p) => {
-      const result = computeTierPricingFromTier({ quantity: p.quantity, price: p.price }, additionalCosts, config);
+    return tierRows.map((row, i) => {
+      const quantity = tierQuantities[i];
+      if (!Number.isInteger(quantity) || quantity <= 0) {
+        return { row, baseCost: null, belowMoq: false, pricing: null };
+      }
+      const baseCost = resolveSupplierCostForQuantity(supplierTiers, quantity);
       return {
-        quantity: p.quantity,
-        baseCost: typeof p.price === "number" ? p.price : parseFloat(String(p.price)) || 0,
-        printUnitCost,
-        markupPercent: resolveMarkupPercentForTier(config, p.quantity),
-        ...result,
+        row,
+        baseCost,
+        belowMoq: quantity < supplierTiers[0].quantity,
+        pricing: computeTierPricingFromTier({ quantity, price: baseCost }, additionalCosts, config),
       };
     });
   }, [
-    product,
-    additionalCosts,
-    globalSettings.defaultMarkupPercent,
+    supplierTiers,
+    tierRows,
+    tierQuantities,
     tierMarkups,
+    additionalCosts,
+    defaultMarkupPercent,
     includeSetup,
     shippingBuffer,
     selectedAdditionalCostId,
-    printUnitCost,
   ]);
 
   // Automatic Override Detection — no manual toggle; a product counts as
   // "custom" the instant any draft value actually differs from the current
-  // shop-wide default. A tierMarkups entry that matches the global default
-  // carries no real override information, so it's filtered out before the
-  // emptiness check (same rule the savePricingOverride action re-verifies
-  // server-side, independent of this client-side value).
+  // shop-wide default (or its tier quantities differ from the supplier's). A
+  // tierMarkups entry that matches the global default carries no real
+  // override information, so it's filtered out before the emptiness check
+  // (same rule the savePricingOverride action re-verifies server-side).
   const effectiveTierMarkups = useMemo(
-    () => filterOverriddenTierMarkups(tierMarkups, globalSettings.defaultMarkupPercent),
-    [tierMarkups, globalSettings.defaultMarkupPercent]
+    () => filterOverriddenTierMarkups(tierMarkups, defaultMarkupPercent),
+    [tierMarkups, defaultMarkupPercent]
   );
   const hasPricingOverride =
+    isCustomTiersDraft ||
     Object.keys(effectiveTierMarkups).length > 0 ||
-    includeSetup !== (globalSettings.defaultIncludeSetupInUnitCost ?? true) ||
-    shippingBuffer !== (globalSettings.defaultShippingBufferPerUnit ?? 0.15) ||
+    includeSetup !== defaultIncludeSetup ||
+    shippingBuffer !== defaultShippingBuffer ||
     selectedAdditionalCostId !== defaultAdditionalCostId;
 
   const handleResetPricingToDefault = () => {
-    setTierMarkups({});
-    setIncludeSetup(globalSettings.defaultIncludeSetupInUnitCost ?? true);
-    setShippingBuffer(globalSettings.defaultShippingBufferPerUnit ?? 0.15);
+    setTierRows(supplierTiers.map((t) => makeTierRow(t.quantity, defaultMarkupPercent)));
+    setIncludeSetup(defaultIncludeSetup);
+    setShippingBuffer(defaultShippingBuffer);
     setSelectedAdditionalCostId(defaultAdditionalCostId);
   };
+
+  // Restores only the supplier's quantity breaks, keeping any markup already
+  // set on a tier whose quantity survives.
+  const handleResetToSupplierTiers = () => {
+    setTierRows(
+      supplierTiers.map((t) => makeTierRow(t.quantity, tierMarkups[String(t.quantity)] ?? defaultMarkupPercent))
+    );
+  };
+
+  const updateTierRow = (key: number, patch: Partial<Omit<TierRow, "key">>) =>
+    setTierRows((rows) => rows.map((r) => (r.key === key ? { ...r, ...patch } : r)));
+  const removeTierRow = (key: number) => setTierRows((rows) => rows.filter((r) => r.key !== key));
+  const addTierRow = () => setTierRows((rows) => [...rows, makeTierRow("", defaultMarkupPercent)]);
 
   // Sync state if productSync changes
   useEffect(() => {
@@ -570,20 +712,6 @@ export default function ProductDetailPage() {
       }
       if (productSync.splitLocationIds && productSync.splitLocationIds.length > 0) {
         setProductSplitLocs(productSync.splitLocationIds);
-      }
-
-      const syncedTierMarkups = productSync.tierMarkups as Record<string, number> | null;
-      if (syncedTierMarkups && Object.keys(syncedTierMarkups).length > 0) {
-        setTierMarkups(syncedTierMarkups);
-      }
-      if (productSync.includeSetupInUnitCost !== null && productSync.includeSetupInUnitCost !== undefined) {
-        setIncludeSetup(productSync.includeSetupInUnitCost);
-      }
-      if (productSync.shippingBufferOverride !== null && productSync.shippingBufferOverride !== undefined) {
-        setShippingBuffer(productSync.shippingBufferOverride);
-      }
-      if (productSync.selectedAdditionalCostId !== null && productSync.selectedAdditionalCostId !== undefined) {
-        setSelectedAdditionalCostId(productSync.selectedAdditionalCostId);
       }
     }
   }, [productSync]);
@@ -626,6 +754,11 @@ export default function ProductDetailPage() {
     // so omitting it is how we signal "no override" for this one dimension.
     if (selectedAdditionalCostId !== defaultAdditionalCostId) {
       formData.append("selectedAdditionalCostId", String(selectedAdditionalCostId ?? ""));
+    }
+    // Same convention for tiers: only sent when they differ from the
+    // supplier's breaks, which only the client has loaded.
+    if (isCustomTiersDraft) {
+      formData.append("customTierQuantitiesJson", JSON.stringify(tierQuantities));
     }
     pricingFetcher.submit(formData, { method: "post" });
   };
@@ -1179,11 +1312,11 @@ export default function ProductDetailPage() {
                 </div>
               </div>
 
-              {computedTiers.length > 0 && (
+              {computedTiers[0]?.pricing && (
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
                   <span style={{ fontSize: "11px", color: "#6d7175" }}>Selling price shown to customers</span>
                   <span style={{ fontSize: "22px", fontWeight: 700, color: "#008060" }}>
-                    {formatCurrency(computedTiers[0].finalSellingPrice, currentRegion)}
+                    {formatCurrency(computedTiers[0].pricing.finalSellingPrice, currentRegion)}
                   </span>
                 </div>
               )}
@@ -1259,67 +1392,147 @@ export default function ProductDetailPage() {
                 </span>
               </label>
 
-              {/* Per-tier breakdown table — each row has its OWN editable
-                  Markup % input (the Trends portal calculator's own
-                  behavior: a 100-qty tier and a 5000-qty tier can carry
-                  completely different margins). An untouched tier shows the
-                  shop-wide default but isn't "locked" to it — typing in any
-                  row creates an explicit override for that tier only. */}
-              {computedTiers.length > 0 && (
-                <div style={{ overflowX: "auto" }}>
-                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px", minWidth: "560px" }}>
-                    <thead>
-                      <tr style={{ color: "#6d7175" }}>
-                        <th style={{ textAlign: "left", padding: "4px 6px" }}>Tier Qty</th>
-                        <th style={{ textAlign: "right", padding: "4px 6px" }}>Base Cost</th>
-                        <th style={{ textAlign: "right", padding: "4px 6px" }}>Print + Setup/Qty</th>
-                        <th style={{ textAlign: "right", padding: "4px 6px" }}>Unit Cost</th>
-                        <th style={{ textAlign: "right", padding: "4px 6px", width: "90px" }}>Markup %</th>
-                        <th style={{ textAlign: "right", padding: "4px 6px" }}>Sell Price</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {computedTiers.map((t, idx) => (
-                        <tr key={idx} style={{ borderTop: "1px solid #e1e3e5" }}>
-                          <td style={{ textAlign: "left", padding: "6px", fontWeight: 600 }}>{t.quantity}+</td>
-                          <td style={{ textAlign: "right", padding: "6px" }}>
-                            {formatCurrency(t.baseCost, currentRegion)}
-                          </td>
-                          <td style={{ textAlign: "right", padding: "6px", color: "#6d7175" }}>
-                            {formatCurrency(t.printUnitCost, currentRegion)} +{" "}
-                            {formatCurrency(t.setupAllocationPerUnit, currentRegion)}
-                          </td>
-                          <td style={{ textAlign: "right", padding: "6px" }}>
-                            {formatCurrency(t.unitCost, currentRegion)}
-                          </td>
-                          <td style={{ textAlign: "right", padding: "4px 6px" }}>
-                            <input
-                              type="number"
-                              min={0}
-                              step={0.1}
-                              value={t.markupPercent}
-                              onChange={(e) => {
-                                const next = Math.max(0, Number(e.target.value) || 0);
-                                setTierMarkups((prev) => ({ ...prev, [String(t.quantity)]: next }));
-                              }}
-                              style={{
-                                width: "100%",
-                                padding: "5px 6px",
-                                fontSize: "12px",
-                                textAlign: "right",
-                                borderRadius: "5px",
-                                border: "1px solid #babfc3",
-                                boxSizing: "border-box",
-                              }}
-                            />
-                          </td>
-                          <td style={{ textAlign: "right", padding: "6px", fontWeight: 700, color: "#008060" }}>
-                            {formatCurrency(t.finalSellingPrice, currentRegion)}
-                          </td>
+              {/* Per-tier table — quantity AND markup are editable per row,
+                  and rows can be added/removed. Each row's base cost is the
+                  supplier's applicable break (highest supplier quantity at or
+                  below it), so custom tiers still track supplier price
+                  changes; once quantities differ from the supplier's, they're
+                  saved as custom tiers that resyncs never overwrite. */}
+              {supplierTiers.length > 0 && (
+                <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px", minWidth: "620px" }}>
+                      <thead>
+                        <tr style={{ color: "#6d7175" }}>
+                          <th style={{ textAlign: "left", padding: "4px 6px", width: "100px" }}>Min Qty</th>
+                          <th style={{ textAlign: "right", padding: "4px 6px" }}>Base Cost</th>
+                          <th style={{ textAlign: "right", padding: "4px 6px" }}>Print + Setup/Qty</th>
+                          <th style={{ textAlign: "right", padding: "4px 6px" }}>Unit Cost</th>
+                          <th style={{ textAlign: "right", padding: "4px 6px", width: "90px" }}>Markup %</th>
+                          <th style={{ textAlign: "right", padding: "4px 6px" }}>Sell Price</th>
+                          <th style={{ width: "32px" }} aria-label="Remove tier" />
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                      </thead>
+                      <tbody>
+                        {computedTiers.map(({ row, baseCost, belowMoq, pricing }) => (
+                          <tr key={row.key} style={{ borderTop: "1px solid #e1e3e5" }}>
+                            <td style={{ textAlign: "left", padding: "4px 6px" }}>
+                              <input
+                                type="number"
+                                min={1}
+                                step={1}
+                                aria-label="Tier minimum quantity"
+                                value={row.quantity}
+                                onChange={(e) => updateTierRow(row.key, { quantity: e.target.value })}
+                                style={{
+                                  width: "100%",
+                                  padding: "5px 6px",
+                                  fontSize: "12px",
+                                  fontWeight: 600,
+                                  borderRadius: "5px",
+                                  border: `1px solid ${pricing ? "#babfc3" : "#d82c0d"}`,
+                                  boxSizing: "border-box",
+                                }}
+                              />
+                            </td>
+                            <td style={{ textAlign: "right", padding: "6px" }}>
+                              {baseCost !== null ? formatCurrency(baseCost, currentRegion) : "—"}
+                              {belowMoq && (
+                                <div
+                                  style={{ fontSize: "10px", color: "#b45309" }}
+                                  title={`Below the supplier's minimum order of ${supplierTiers[0].quantity} — priced at that break's cost`}
+                                >
+                                  below MOQ
+                                </div>
+                              )}
+                            </td>
+                            <td style={{ textAlign: "right", padding: "6px", color: "#6d7175" }}>
+                              {pricing
+                                ? `${formatCurrency(printUnitCost, currentRegion)} + ${formatCurrency(pricing.setupAllocationPerUnit, currentRegion)}`
+                                : "—"}
+                            </td>
+                            <td style={{ textAlign: "right", padding: "6px" }}>
+                              {pricing ? formatCurrency(pricing.unitCost, currentRegion) : "—"}
+                            </td>
+                            <td style={{ textAlign: "right", padding: "4px 6px" }}>
+                              <input
+                                type="number"
+                                min={0}
+                                step={0.1}
+                                aria-label="Tier markup percent"
+                                value={row.markupPercent}
+                                onChange={(e) =>
+                                  updateTierRow(row.key, { markupPercent: Math.max(0, Number(e.target.value) || 0) })
+                                }
+                                style={{
+                                  width: "100%",
+                                  padding: "5px 6px",
+                                  fontSize: "12px",
+                                  textAlign: "right",
+                                  borderRadius: "5px",
+                                  border: "1px solid #babfc3",
+                                  boxSizing: "border-box",
+                                }}
+                              />
+                            </td>
+                            <td style={{ textAlign: "right", padding: "6px", fontWeight: 700, color: "#008060" }}>
+                              {pricing ? formatCurrency(pricing.finalSellingPrice, currentRegion) : "—"}
+                            </td>
+                            <td style={{ textAlign: "center", padding: "4px" }}>
+                              <button
+                                type="button"
+                                onClick={() => removeTierRow(row.key)}
+                                disabled={tierRows.length <= 1}
+                                aria-label="Remove tier"
+                                title={tierRows.length <= 1 ? "At least one tier is required" : "Remove tier"}
+                                style={{
+                                  background: "none",
+                                  border: "none",
+                                  fontSize: "16px",
+                                  lineHeight: 1,
+                                  color: tierRows.length <= 1 ? "#c9cccf" : "#d82c0d",
+                                  cursor: tierRows.length <= 1 ? "not-allowed" : "pointer",
+                                }}
+                              >
+                                ×
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
+                    <Button variant="outline" size="sm" onClick={addTierRow}>
+                      + Add Tier
+                    </Button>
+                    {isCustomTiersDraft && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={handleResetToSupplierTiers}
+                          style={{
+                            fontSize: "11px",
+                            fontWeight: 600,
+                            color: "#b45309",
+                            background: "none",
+                            border: "none",
+                            padding: 0,
+                            cursor: "pointer",
+                            textDecoration: "underline",
+                          }}
+                        >
+                          Reset to Supplier Default Tiers
+                        </button>
+                        <span style={{ fontSize: "11px", color: "#6d7175" }}>
+                          Custom tiers — resyncs from Trends won&apos;t overwrite them.
+                        </span>
+                      </>
+                    )}
+                  </div>
+
+                  {tierError && <div style={{ fontSize: "12px", color: "#b91c1c" }}>⚠️ {tierError}</div>}
                 </div>
               )}
 
@@ -1328,6 +1541,8 @@ export default function ProductDetailPage() {
                   variant="primary"
                   size="sm"
                   loading={pricingFetcher.state === "submitting"}
+                  disabled={!hasUnsavedPricingChanges || Boolean(tierError) || pricingFetcher.state === "submitting"}
+                  title={hasUnsavedPricingChanges ? undefined : "No changes to save"}
                   onClick={handleSavePricingOverride}
                 >
                   {pricingFetcher.state === "submitting" ? "Saving..." : "Save Pricing"}

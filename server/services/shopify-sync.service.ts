@@ -6,10 +6,18 @@ import { TrendsApiClient } from "../api-client/trends-client";
 import { getAppSettings } from "../settings/app-settings.service";
 import prisma from "../../app/db.server";
 import {
+  buildEffectiveTiers,
   computeTierPricingFromTier,
   findDefaultAdditionalCost,
+  normalizeSupplierTiers,
   type ResolvedPricingConfig,
 } from "../../shared/utils/pricing-engine";
+import {
+  buildBrandingMetafield,
+  extractSupportedMethodNames,
+  fetchBrandingOptions,
+  filterBrandingOptionsForProduct,
+} from "./branding-service.server";
 
 export type SyncStage =
   | "QUEUED"
@@ -133,9 +141,31 @@ function buildDescriptionHtml(product: ProductData): string {
 }
 
 /**
+ * The merchant's custom tiers (priced against the primary pricing group, the
+ * same group the Product Details page edits), or null when the product uses
+ * the supplier's own quantity breaks.
+ */
+function resolveCustomTiers(product: ProductData, pricingConfig: ResolvedPricingConfig) {
+  if (!pricingConfig.customTierQuantities?.length) return null;
+  const primary = normalizePricing(product.pricing)[0];
+  const supplierTiers = normalizeSupplierTiers(primary?.prices);
+  if (supplierTiers.length === 0) return null;
+  return {
+    tiers: buildEffectiveTiers(supplierTiers, pricingConfig.customTierQuantities),
+    additionalCosts: primary.additional_costs,
+  };
+}
+
+/**
  * Extracts base wholesale price formatted to 2 decimal places in regional currency.
  */
 export function extractBasePrice(product: ProductData, region: Region, pricingConfig: ResolvedPricingConfig): string {
+  const custom = resolveCustomTiers(product, pricingConfig);
+  if (custom) {
+    const { finalSellingPrice } = computeTierPricingFromTier(custom.tiers[0], custom.additionalCosts, pricingConfig);
+    return finalSellingPrice.toFixed(2);
+  }
+
   const pricingList = normalizePricing(product.pricing);
   if (pricingList.length > 0) {
     for (const group of pricingList) {
@@ -178,14 +208,22 @@ export interface VolumePricingTier {
 /**
  * Builds the normalized volume-pricing tier list for the `custom.volume_pricing`
  * product metafield, consumed by the tiered-discount-function Shopify Function
- * at checkout. Reads whatever dynamic quantity breaks the Trends API returned
- * for this product this sync — never hardcoded — so re-syncing always refreshes
- * tiers to the supplier's current pricing.
+ * at checkout. Uses the merchant's custom tiers when set (never overwritten by
+ * a resync — only their base costs refresh), otherwise whatever quantity
+ * breaks the Trends API returned for this product this sync.
  */
 export function buildVolumePricingTiers(
   product: ProductData,
   pricingConfig: ResolvedPricingConfig
 ): VolumePricingTier[] {
+  const custom = resolveCustomTiers(product, pricingConfig);
+  if (custom) {
+    return custom.tiers.map((tier) => ({
+      minQuantity: tier.quantity,
+      price: computeTierPricingFromTier(tier, custom.additionalCosts, pricingConfig).finalSellingPrice,
+    }));
+  }
+
   const tiers: VolumePricingTier[] = [];
 
   for (const group of normalizePricing(product.pricing)) {
@@ -1883,6 +1921,10 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
     shippingBufferPerUnit: existingSync?.shippingBufferOverride ?? appSettings.defaultShippingBufferPerUnit,
     selectedAdditionalCostId:
       existingSync?.selectedAdditionalCostId ?? (defaultAdditionalCostId ? Number(defaultAdditionalCostId) : null),
+    customTierQuantities:
+      existingSync?.isCustomTiers && existingSync.customTierQuantities.length > 0
+        ? existingSync.customTierQuantities
+        : null,
   };
 
   // 2. Ensure product has live stock data from Trends API stock endpoint (/api/v1/stock/{id}.json)
@@ -2055,6 +2097,15 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
     // Resolve active primary fulfillment location (cached)
     const primaryLocationId = await fetchStoreFulfillmentLocation(admin, normalizedRegion, shop);
 
+    // Stamped on every sync with only the methods this supplier product
+    // supports — [] when none, which also clears an older all-methods value.
+    // Skipped entirely until the branding service is connected in Settings.
+    const masterBrandingOptions = await fetchBrandingOptions(admin, shop);
+    const brandingOptions = filterBrandingOptionsForProduct(
+      masterBrandingOptions,
+      extractSupportedMethodNames(trendsProduct)
+    );
+
     const metafields = [
       {
         namespace: "trends",
@@ -2108,6 +2159,7 @@ export async function syncTrendProductToShopify(options: SyncTrendProductOptions
         type: "date_time",
         value: new Date().toISOString(),
       },
+      ...(masterBrandingOptions.length > 0 ? [buildBrandingMetafield(brandingOptions)] : []),
       ...(isMockProduct
         ? [
             {

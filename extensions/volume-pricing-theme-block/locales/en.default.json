@@ -1,5 +1,20 @@
 {
   "quantity": "Quantity",
   "unit_price": "Unit price",
-  "default_title": "Volume Pricing"
+  "default_title": "Volume Pricing",
+  "branding": {
+    "method_label": "Branding method",
+    "no_branding": "No branding (plain items only)",
+    "option_label": "{{ name }} — {{ setup }} setup + {{ run }}/unit",
+    "colour_label": "Number of colours in logo:",
+    "position_label": "Number of print positions:",
+    "setup_line": "One-time setup fee: {{ multiplier }} × {{ cost }} = {{ total }}",
+    "run_line": "Per-unit run charge: {{ quantity }} × {{ multiplier }} × {{ cost }} = {{ total }}",
+    "total_line": "Extra branding cost: {{ total }}",
+    "cart_note": "Setup and run charges are added to your cart as separate items.",
+    "property_branding": "Branding",
+    "property_for": "For",
+    "add_error": "Couldn't add the branding charges to your cart. Please try again.",
+    "editor_note": "Custom branding options only appear on the storefront when the \"Volume Pricing Engine\" app embed is enabled."
+  }
 }
